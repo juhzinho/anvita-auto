@@ -3194,6 +3194,41 @@ async function sequentialBatchMain(count = 5) {
   if (ok < count) process.exitCode = 1;
 }
 
+function isProcessAlive(pid) {
+  if (!pid || pid <= 0) return false;
+  try {
+    if (process.platform === "win32") {
+      const out = execSync(`tasklist /FI "PID eq ${pid}" /NH`, {
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "ignore"],
+      });
+      return out.includes(String(pid));
+    }
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clearStalePoolLock(lockPath) {
+  if (!existsSync(lockPath)) return;
+  try {
+    const raw = readFileSync(lockPath, "utf8").trim();
+    const pid = parseInt(raw, 10);
+    if (!isProcessAlive(pid)) {
+      unlinkSync(lockPath);
+      console.log(`Lock órfão removido (PID ${raw}).`);
+    }
+  } catch {
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 function killOtherPoolProcesses() {
   if (process.env.ANVITA_POOL_NO_KILL === "1") {
     console.log("ANVITA_POOL_NO_KILL=1 — pool anterior mantém-se (browsers terminam jobs).");
@@ -3261,22 +3296,31 @@ async function poolMain(total = 100, workers = 2) {
   }
 
   async function withPoolFileLock(fn) {
+    clearStalePoolLock(poolResultsLockPath);
     const start = Date.now();
-    while (Date.now() - start < 120_000) {
+    let acquired = false;
+    while (Date.now() - start < 30_000) {
       try {
         writeFileSync(poolResultsLockPath, String(process.pid), { flag: "wx" });
+        acquired = true;
         break;
       } catch {
+        clearStalePoolLock(poolResultsLockPath);
         await sleep(150 + Math.random() * 100);
       }
+    }
+    if (!acquired) {
+      console.warn("⚠ pool-results.lock ocupado — a continuar sem lock.");
     }
     try {
       return await fn();
     } finally {
-      try {
-        unlinkSync(poolResultsLockPath);
-      } catch {
-        /* ignore */
+      if (acquired) {
+        try {
+          unlinkSync(poolResultsLockPath);
+        } catch {
+          /* ignore */
+        }
       }
     }
   }
@@ -3293,6 +3337,7 @@ async function poolMain(total = 100, workers = 2) {
   }
 
   killOtherPoolProcesses();
+  clearStalePoolLock(poolResultsLockPath);
   await sleep(1500);
 
   if (existsSync(poolLockPath)) {
@@ -3551,6 +3596,7 @@ async function poolMain(total = 100, workers = 2) {
   }
 
   const workerBrowsers = Array.from({ length: workers }, (_, i) => new WorkerBrowser(i + 1));
+  console.log(`Workers W1–W${getActiveWorkerLimit()} a arrancar…\n`);
   await Promise.all(workerBrowsers.map((wb, i) => workerLoop(i + 1, wb)));
   for (const wb of workerBrowsers) await wb.close();
 
