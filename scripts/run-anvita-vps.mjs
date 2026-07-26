@@ -26,6 +26,7 @@ const browser = (args[2] || process.env.ANVITA_BROWSER || defaultBrowser).toLowe
 
 process.env.ANVITA_VPS = "1";
 if (process.env.ANVITA_HEADED == null) process.env.ANVITA_HEADED = "0";
+if (process.env.ANVITA_GUARD == null) process.env.ANVITA_GUARD = "0";
 process.env.ANVITA_BROWSER = browser;
 process.env.ANVITA_POOL_TOTAL = String(total);
 process.env.ANVITA_POOL_WORKERS = String(workers);
@@ -33,7 +34,7 @@ process.env.ANVITA_POOL_WORKERS = String(workers);
 const platformLabel = process.platform === "win32" ? "Windows VPS" : "Linux VPS";
 const headless = process.env.ANVITA_HEADED === "0";
 console.log(
-  `Anvita ${platformLabel} — ${total} contas, ${workers} workers, browser=${browser}, headless=${headless}`
+  `Anvita ${platformLabel} — ${total} contas, ${workers} workers, browser=${browser}, headless=${headless}, guard=${process.env.ANVITA_GUARD === "1"}`
 );
 
 function run(cmd, cmdArgs) {
