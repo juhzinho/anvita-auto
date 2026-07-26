@@ -3,8 +3,8 @@
  * Runner VPS (Windows ou Linux) — headless, multi-browser.
  *
  *   npm run anvita:vps
- *   node scripts/run-anvita-vps.mjs 500 2 edge
- *   node scripts/run-anvita-vps.mjs 50 3 chrome
+ *   node scripts/run-anvita-vps.mjs 500 5 edge
+ *   node scripts/run-anvita-vps.mjs 50 5 chrome
  *
  * Windows VPS default: Edge (já vem instalado)
  * Linux VPS default: chromium
@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2).filter((a) => !a.startsWith("--"));
 const total = args[0] || process.env.ANVITA_POOL_TOTAL || "500";
-const workers = args[1] || process.env.ANVITA_POOL_WORKERS || "2";
+const workers = args[1] || process.env.ANVITA_POOL_WORKERS || "5";
 const defaultBrowser = process.platform === "win32" ? "edge" : "chromium";
 const browser = (args[2] || process.env.ANVITA_BROWSER || defaultBrowser).toLowerCase();
 
