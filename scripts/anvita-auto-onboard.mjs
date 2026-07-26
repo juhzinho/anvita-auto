@@ -564,6 +564,8 @@ class BlackScreenGuard {
 const pageGuards = new WeakMap();
 /** Evita Guard + FlowBrain a chamarem runFullByoaWizard em paralelo (loop infinito). */
 const byoaInProgress = new WeakMap();
+/** Generate Soul já clicado nesta página — chat VPS demora a hidratar. */
+const soulGenerated = new WeakMap();
 /** Pós-envio: composer some brevemente — Guard não deve dar reload. */
 const chatBusyUntil = new WeakMap();
 /** Fase @prospilot activa — bloqueia reloads no chat. */
@@ -2011,7 +2013,9 @@ async function runFullByoaWizard(page, agent = AGENT, slot = 0) {
   }
 
   byoaInProgress.set(page, true);
+  pausePageGuard(page);
   const b = flowBrain(page, slot);
+  let didGenerateSoul = soulGenerated.get(page);
 
   try {
   for (let round = 1; round <= 10; round++) {
@@ -2020,22 +2024,43 @@ async function runFullByoaWizard(page, agent = AGENT, slot = 0) {
       return true;
     }
 
-    slotLog(slot, `🤖 BYOA completo — ronda ${round}/10`);
-
-    await dismissPromoOverlay(page).catch(() => {});
-
     const generalSidebar = await page
       .getByRole("button", { name: /General chat/i })
       .first()
       .isVisible()
       .catch(() => false);
+
+    if (generalSidebar && (didGenerateSoul || (await hasAgentSidebarReady(page)))) {
+      slotLog(slot, "✅ Agente activo — sidebar General chat (VPS)");
+      soulGenerated.set(page, true);
+      await clickGeneralChat(page).catch(() => {});
+      await wakeComposer(page, slot, 15_000).catch(() => {});
+      return true;
+    }
+
+    slotLog(slot, `🤖 BYOA completo — ronda ${round}/10`);
+
+    await dismissPromoOverlay(page).catch(() => {});
+
     if (generalSidebar) {
       await clickGeneralChat(page).catch(() => {});
       await waitForChatAfterGenerateSoul(page, slot, agent);
       if (await hasActiveChat(page)) return true;
       await recoverPostInitBlack(page, slot, agent).catch(() => {});
       if (await hasActiveChat(page)) return true;
+      if (round >= 3 && (await hasAgentSidebarReady(page))) {
+        slotLog(slot, "✅ Sidebar detectada — continuar (VPS)");
+        soulGenerated.set(page, true);
+        return true;
+      }
       await sleep(1000);
+      continue;
+    }
+
+    if (didGenerateSoul) {
+      await page.goto(`${FLOW}/agent/chat`, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
+      await recoverPostInitBlack(page, slot, agent).catch(() => {});
+      if (await hasActiveChat(page)) return true;
       continue;
     }
 
@@ -2074,6 +2099,8 @@ async function runFullByoaWizard(page, agent = AGENT, slot = 0) {
       if (!(await clickGenerateSoulWhenReady(page, 45_000))) {
         throw new Error("Generate Soul indisponível");
       }
+      didGenerateSoul = true;
+      soulGenerated.set(page, true);
       await sleep(800);
     }
 
@@ -2087,6 +2114,7 @@ async function runFullByoaWizard(page, agent = AGENT, slot = 0) {
 
   throw new Error("BYOA falhou — Welcome/sem agente após 10 rondas.");
   } finally {
+    resumePageGuard(page);
     byoaInProgress.delete(page);
   }
 }
@@ -2139,6 +2167,22 @@ async function isLegitimateInitScreen(page) {
   });
 }
 
+/** Headless VPS: sidebar General chat + agente = OK (composer hidrata depois). */
+async function hasAgentSidebarReady(page) {
+  return safeEvaluate(page, () => {
+    const text = document.body?.innerText || "";
+    const hasGeneral = [...document.querySelectorAll("button")].some((b) =>
+      /general chat/i.test(b.textContent || "")
+    );
+    if (!hasGeneral) return false;
+    return (
+      /Transfer \(Built-in\)|MeuAgentePro|dedicated Anvita On smart concierge|Tell me the result/i.test(
+        text
+      ) && text.length > 80
+    );
+  }).catch(() => false);
+}
+
 async function hasActiveChat(page) {
   if (await isWelcomeNoAgent(page)) return false;
   if (await isLegitimateInitScreen(page)) return false;
@@ -2150,7 +2194,11 @@ async function hasActiveChat(page) {
   if (!generalVisible) return false;
   if (await composerReady(page)) return true;
   if (await chatHasMessages(page)) return true;
-  return hasChatUiReady(page);
+  if (await hasChatUiReady(page)) return true;
+  if (process.env.ANVITA_VPS === "1" && (soulGenerated.get(page) || (await hasAgentSidebarReady(page)))) {
+    return true;
+  }
+  return false;
 }
 
 async function ensureAgentOnChat(page, agent = AGENT, slot = 0) {
