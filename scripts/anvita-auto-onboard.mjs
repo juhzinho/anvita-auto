@@ -44,8 +44,9 @@ const OTP_TIMEOUT_MS = Number(process.env.ANVITA_OTP_TIMEOUT_MS || (process.env.
 const POOL_MAX_ROUNDS = Math.max(3, Number(process.env.ANVITA_POOL_RETRIES || 8));
 const BROWSER_RESTART_EVERY = Math.max(5, Number(process.env.ANVITA_BROWSER_RESTART_EVERY || 12));
 const STUCK_PHASE_MS = Number(process.env.ANVITA_STUCK_MS || 90_000);
-const BLACK_SCREEN_POLL_MS = Number(process.env.ANVITA_BLACK_POLL_MS || 600);
-const BLACK_RECOVER_MAX = Number(process.env.ANVITA_BLACK_RECOVER_MAX || 14);
+const BLACK_SCREEN_POLL_MS = Number(process.env.ANVITA_BLACK_POLL_MS || 300);
+const BLACK_RECOVER_MAX = Number(process.env.ANVITA_BLACK_RECOVER_MAX || 18);
+const SPA_HYDRATE_MS = Number(process.env.ANVITA_SPA_WAIT_MS || 1200);
 const PROSPILOT_ACK_MS = Number(process.env.ANVITA_PROSPILOT_ACK_MS || 45_000);
 const PROSPILOT_SILENT_MS = Number(process.env.ANVITA_PROSPILOT_SILENT_MS || 35_000);
 const PROSPILOT_CMD_TEXT = `@prospilot ${process.env.ANVITA_PROSPILOT_CMD || "What is Faroo?"}`;
@@ -214,8 +215,9 @@ async function runWithRecovery(page, slot, label, fn, maxAttempts = 4, agent = A
 
 async function probePageHealth(page) {
   if (page.isClosed()) return { closed: true, blackScreen: true, healthy: false };
+  const url = page.url();
   return page
-    .evaluate(() => {
+    .evaluate(({ chatPath }) => {
       const text = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
       const title = document.title || "";
       const buttons = document.querySelectorAll("button").length;
@@ -223,7 +225,15 @@ async function probePageHealth(page) {
       const root = document.querySelector("#root, #__next, main, [class*='layout']");
       const rootText = (root?.innerText || "").replace(/\s+/g, " ").trim();
       const bg = getComputedStyle(document.body).backgroundColor || "";
-      const isDarkBg = /rgb\(\s*0,\s*0,\s*0\)|rgb\(17|rgba\(0,\s*0,\s*0|#000/i.test(bg);
+      const isDarkBg = /rgb\(\s*0,\s*0,\s*0\)|rgb\(1[0-7],\s*1[0-7]|rgba\(0,\s*0,\s*0|#000/i.test(bg);
+
+      const visibleUi = [...document.querySelectorAll("button, a, input, textarea, [contenteditable], nav, aside, h1, h2, h3, p")].filter(
+        (el) => {
+          const r = el.getBoundingClientRect();
+          return r.width > 8 && r.height > 8 && el.offsetParent !== null;
+        }
+      ).length;
+
       const hasGeneral = [...document.querySelectorAll("button")].some((b) =>
         /general chat/i.test(b.textContent || "")
       );
@@ -241,15 +251,22 @@ async function probePageHealth(page) {
       const addAgentBtn = [...document.querySelectorAll("button")].some((b) =>
         /^Add Agent$/i.test((b.textContent || "").trim())
       );
-      const noUi = buttons < 4 && inputs < 2 && text.length < 100;
+      const onChat = location.href.includes("/agent/chat");
+
+      // Tela preta: título Initialize + zero UI, ou página chat sem conteúdo visível
       const blackScreen =
-        (isDarkBg && text.length < 180 && !composerOk && !hasGeneral) ||
-        (initTitle && !composerOk && !hasGeneral && text.length < 250) ||
-        (noUi && !welcome && !addAgentBtn && text.length < 80) ||
-        (rootText.length < 40 && buttons < 3 && !composerOk);
+        (initTitle && !composerOk && !hasGeneral && !welcome) ||
+        (onChat && text.length < 30 && visibleUi < 6 && !composerOk) ||
+        (onChat && isDarkBg && visibleUi < 8 && !hasGeneral && !welcome && !addAgentBtn) ||
+        (text.length < 15 && visibleUi < 4 && !welcome) ||
+        (rootText.length < 20 && buttons < 2 && !composerOk && onChat);
+
+      const hasValidUi = welcome || addAgentBtn || hasGeneral || composerOk || /Establish Identity|Send OTP/i.test(text);
+
       return {
         textLen: text.length,
         rootTextLen: rootText.length,
+        visibleUi,
         buttons,
         isDarkBg,
         title,
@@ -260,10 +277,91 @@ async function probePageHealth(page) {
         addAgentBtn,
         hasGeneral,
         hasComposer: composerOk,
+        hasValidUi,
         healthy: hasGeneral && composerOk,
       };
-    })
-    .catch(() => ({ blackScreen: true, healthy: false, textLen: 0 }));
+    }, { chatPath: "/agent/chat" })
+    .catch(() => ({ blackScreen: true, healthy: false, textLen: 0, initTitle: true }));
+}
+
+async function assertNotBlack(page, slot, agent, label = "page") {
+  const b = flowBrain(page, slot);
+  for (let i = 0; i < 12; i++) {
+    const h = await probePageHealth(page);
+    if (!h.blackScreen && !h.initTitle && (h.hasValidUi || h.healthy)) return h;
+    b.log(`⚡ ${label}: tela preta detectada — recuperar já (${i + 1}/12)`);
+    await b.execute("black", agent);
+    await sleep(SPA_HYDRATE_MS);
+  }
+  throw new Error(`${label}: tela preta persistente após 12 recuperações rápidas.`);
+}
+
+/** Vigilante contínuo — detecta tela preta a cada ~300ms e actua sozinho. */
+class BlackScreenGuard {
+  constructor(page, slot = 0, agent = AGENT) {
+    this.page = page;
+    this.slot = slot;
+    this.agent = agent;
+    this.recovering = false;
+    this.stopped = false;
+    this._timer = null;
+  }
+
+  setAgent(agent) {
+    this.agent = agent;
+  }
+
+  start() {
+    if (this._timer) return;
+    this.stopped = false;
+    this._timer = setInterval(() => {
+      this.tick().catch(() => {});
+    }, BLACK_SCREEN_POLL_MS);
+  }
+
+  stop() {
+    this.stopped = true;
+    if (this._timer) clearInterval(this._timer);
+    this._timer = null;
+  }
+
+  async tick() {
+    if (this.stopped || this.recovering || this.page.isClosed()) return;
+    const url = this.page.url();
+    if (!url.includes("anvita.xyz")) return;
+
+    const h = await probePageHealth(this.page).catch(() => ({ blackScreen: true, initTitle: true }));
+    if (!h.blackScreen && !h.initTitle) return;
+
+    this.recovering = true;
+    try {
+      if (this.slot) slotLog(this.slot, "⚡ Guard IA: tela preta — recuperação automática");
+      else console.log("     ⚡ Guard IA: tela preta — recuperação automática");
+      await flowBrain(this.page, this.slot).execute("black", this.agent);
+    } finally {
+      this.recovering = false;
+    }
+  }
+}
+
+const pageGuards = new WeakMap();
+
+function attachPageGuard(page, slot, agent = AGENT) {
+  const existing = pageGuards.get(page);
+  if (existing) {
+    existing.setAgent(agent);
+    return existing;
+  }
+  const guard = new BlackScreenGuard(page, slot, agent);
+  pageGuards.set(page, guard);
+  guard.start();
+  return guard;
+}
+
+function detachPageGuard(page) {
+  const guard = pageGuards.get(page);
+  if (guard) guard.stop();
+  pageGuards.delete(page);
 }
 
 class FlowBrain {
@@ -293,7 +391,7 @@ class FlowBrain {
     if (state.closed) return "browser-dead";
     if (state.healthy) return "ok";
     if (state.hasWaf || state.hasCaptcha) return "waf";
-    if (state.blackScreen || state.initTitle || (state.textLen < 60 && !state.welcome)) return "black";
+    if (state.blackScreen || state.initTitle || (state.textLen < 40 && !state.hasValidUi)) return "black";
     if (state.welcome || state.hasWelcomeNoAgent || state.addAgentBtn) return "welcome";
     if (state.initBody || state.hasInitializing || state.phase === "stuck-init") return "stuck-init";
     if (state.hasAddAgentModal) return "byoa-modal";
@@ -316,24 +414,34 @@ class FlowBrain {
         return true;
       case "black": {
         this.log(`Tela preta/UI vazia — escada ${n}/${BLACK_RECOVER_MAX}`);
-        const step = (n - 1) % 7;
-        if (step === 0) await page.reload({ waitUntil: "load", timeout: 90_000 }).catch(() => {});
+        await sleep(SPA_HYDRATE_MS);
+        const recheck = await probePageHealth(page);
+        if (!recheck.blackScreen && !recheck.initTitle && recheck.hasValidUi) return true;
+
+        const step = (n - 1) % 8;
+        if (step === 0) await page.reload({ waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
         else if (step === 1)
-          await page.goto(`${FLOW}/agent/chat`, { waitUntil: "networkidle", timeout: 90_000 }).catch(() => {});
+          await page.goto(`${FLOW}/agent/chat`, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
         else if (step === 2) {
-          await page.goto(`${FLOW}/m/agent-init`, { waitUntil: "load", timeout: 90_000 }).catch(() => {});
+          await page.goto(`${FLOW}/dashboard`, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
+          await sleep(800);
+          await page.goto(`${FLOW}/agent/chat`, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
+        } else if (step === 3) {
+          await page.goto(`${FLOW}/m/agent-init`, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
           await sleep(800);
           await startAgentWizard(page);
-        } else if (step === 3) {
+        } else if (step === 4) {
           await page.evaluate(() => window.location.reload()).catch(() => {});
           await sleep(2500);
-        } else if (step === 4) {
+        } else if (step === 5) {
           await dismissPromoOverlay(page);
-          await page.goto(`${FLOW}/agent/chat`, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
-        } else if (step === 5) await escapeStuckInit(page);
+          await page.goto(`${FLOW}/agent/chat`, { waitUntil: "load", timeout: 90_000 }).catch(() => {});
+          await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
+        } else if (step === 6) await escapeStuckInit(page);
         else if (agent) await ensureAgentOnChat(page, agent);
         else await startAgentWizard(page);
         await dismissPromoOverlay(page);
+        await sleep(600);
         return true;
       }
       case "welcome":
@@ -552,15 +660,21 @@ function assertPageOpen(page) {
   }
 }
 
-async function smartGoto(page, url, timeout = 60_000) {
+async function smartGoto(page, url, timeout = 60_000, slot = 0, agent = AGENT) {
   assertPageOpen(page);
   for (let attempt = 1; attempt <= 4; attempt++) {
     try {
       await page.goto(url, { waitUntil: NAV_WAIT, timeout });
       await dismissPromoOverlay(page);
-      const health = await probePageHealth(page);
-      if (health.blackScreen && url.includes("/agent/chat")) {
-        await flowBrain(page, 0).execute("black", AGENT);
+      if (url.includes("/agent/chat") || url.includes("/agent-init")) {
+        await assertNotBlack(page, slot, agent, "goto").catch(async () => {
+          await flowBrain(page, slot).execute("black", agent);
+        });
+      } else {
+        const health = await probePageHealth(page);
+        if (health.blackScreen || health.initTitle) {
+          await flowBrain(page, slot).execute("black", agent);
+        }
       }
       return;
     } catch (err) {
@@ -2018,6 +2132,7 @@ async function createBrowserSession(browser, slot = 1) {
   }
   const context = await browser.newContext(ctxOpts);
   const page = await context.newPage();
+  attachPageGuard(page, slot);
   await openRegisterPage(page);
   return { context, page };
 }
@@ -2084,6 +2199,7 @@ async function saveSession(context, creds, slot = 1) {
 
 async function runOnboard({ page, context, slot = 1, agent = AGENT, mailbox: presetMailbox }) {
   let mailbox = null;
+  attachPageGuard(page, slot, agent);
 
   for (let mailTry = 1; mailTry <= 5; mailTry++) {
     if (mailTry === 1 && presetMailbox) {
@@ -2459,6 +2575,7 @@ async function poolMain(total = 100, workers = 2) {
       return true;
     } finally {
       await withLock(() => inFlight.delete(targetNum));
+      if (page) detachPageGuard(page);
       if (context) await saveSession(context, null, targetNum).catch(() => {});
       if (context) await context.close().catch(() => {});
     }
