@@ -79,6 +79,7 @@ async function analyzePageSituation(page) {
         hasProfile: /Set up your profile/i.test(text),
         hasWizard: /Establish Identity|Shape Personality|Generate Soul|Agent Name/i.test(text),
         hasChat: /General chat|Tell your agent|File List/i.test(text),
+        hasWelcomeNoAgent: /Welcome to Anvita Flow|Add your personal steward agent|experience a new paradigm/i.test(text),
         hasInitializing: /Initializing|Shaping the soul of your Anvita/i.test(text),
         hasAddAgentModal: /Add Agent|Bring Your Own Agent|Connect your existing agent/i.test(text),
         emailRegistered: /already registered|email is already/i.test(text),
@@ -99,7 +100,8 @@ async function analyzePageSituation(page) {
     if (state.hasProfile) phase = "register-profile";
     else if (state.hasOtp) phase = "register-otp";
     else phase = "register-email";
-  } else if (state.hasWizard || url.includes("/agent-init")) phase = "agent-wizard";
+  }   else if (state.hasWizard || url.includes("/agent-init")) phase = "agent-wizard";
+  else if (state.hasWelcomeNoAgent && url.includes("/agent/chat")) phase = "welcome-no-agent";
   else if (url.includes("/agent/chat") || state.hasChat) phase = "chat";
   else if (url.includes("/authorize")) phase = "authorize";
 
@@ -136,6 +138,11 @@ async function smartRecover(page, slot, situation, errMsg) {
 
   if (situation?.hasAddAgentModal) {
     await resolveAddAgentModal(page);
+    return true;
+  }
+
+  if (situation?.phase === "welcome-no-agent" || situation?.hasWelcomeNoAgent) {
+    await startAgentWizard(page);
     return true;
   }
 
@@ -993,6 +1000,83 @@ async function resolveAddAgentModal(page) {
   return false;
 }
 
+async function isWelcomeNoAgent(page) {
+  return page.evaluate(() => {
+    const text = document.body?.innerText || "";
+    const welcome = /Welcome to Anvita Flow|Add your personal steward agent|experience a new paradigm/i.test(text);
+    const addBtn = [...document.querySelectorAll("button")].some((b) =>
+      /^Add Agent$/i.test((b.textContent || "").trim())
+    );
+    const generalBtn = [...document.querySelectorAll("button")].some((b) =>
+      /general chat/i.test(b.textContent || "")
+    );
+    const composer = document.querySelector(
+      '[contenteditable="true"].tiptap, [contenteditable="true"][data-placeholder*="Tell"]'
+    );
+    const composerOk =
+      composer &&
+      composer.getBoundingClientRect().width > 80 &&
+      composer.getBoundingClientRect().height > 15 &&
+      composer.offsetParent !== null;
+    return (welcome || addBtn) && !composerOk && !generalBtn;
+  });
+}
+
+async function hasActiveChat(page) {
+  if (await isWelcomeNoAgent(page)) return false;
+  if (await isStuckInitializing(page)) return false;
+  const generalVisible = await page
+    .getByRole("button", { name: /General chat/i })
+    .first()
+    .isVisible()
+    .catch(() => false);
+  return generalVisible && (await composerReady(page));
+}
+
+async function ensureAgentOnChat(page, agent = AGENT) {
+  if (await hasActiveChat(page)) return true;
+
+  if (!(await isWelcomeNoAgent(page))) {
+    const addAgent = page.getByRole("button", { name: /^Add Agent$/i });
+    if (!(await addAgent.isVisible().catch(() => false))) {
+      return false;
+    }
+  }
+
+  console.log("     ⚠ Welcome/sem agente — completar wizard BYOA…");
+  await startAgentWizard(page);
+
+  if (await page.getByText(/Establish Identity|Agent Name/i).first().isVisible().catch(() => false)) {
+    console.log("     Retomar wizard: Identity → Persona → Generate Soul");
+    await fillAgentIdentity(page, agent);
+    if (!(await clickContinueWhenReady(page, 45_000))) {
+      throw new Error("Continue bloqueado no passo Identity (welcome recovery).");
+    }
+    await sleep(500);
+    await page.getByText(/Shape Personality|Core Archetype/i).first().waitFor({ state: "visible", timeout: 30_000 });
+    await selectPersonaStep(page, agent);
+    await sleep(300);
+    if (!(await clickContinueWhenReady(page, 45_000))) {
+      throw new Error("Continue bloqueado no passo Personality (welcome recovery).");
+    }
+    await sleep(500);
+    if (!(await clickGenerateSoulWhenReady(page, 45_000))) {
+      throw new Error("Generate Soul indisponível (welcome recovery).");
+    }
+    await sleep(1000);
+  }
+
+  await waitPastInitializing(page, 60_000);
+  await ensureChatLoaded(page, "welcome-recovery");
+  await openGeneralChat(page);
+  await waitForComposer(page, 90_000);
+
+  if (!(await hasActiveChat(page))) {
+    throw new Error("Agente não ficou activo após Welcome — chat indisponível.");
+  }
+  return true;
+}
+
 async function isStuckInitializing(page) {
   return page.evaluate(() => {
     const t = document.body?.innerText || "";
@@ -1021,18 +1105,31 @@ async function escapeStuckInit(page) {
 async function waitPastInitializing(page, maxMs = 45_000) {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
+    if (await isWelcomeNoAgent(page)) {
+      console.log("     Welcome sem agente após soul — reabrir BYOA…");
+      await startAgentWizard(page);
+      await sleep(1500);
+      continue;
+    }
     if (await isStuckInitializing(page)) {
       await sleep(2000);
       continue;
     }
-    if (page.url().includes("/agent/chat") && !(await isChatBlank(page))) return true;
-    if (await page.getByText(/General chat/i).first().isVisible().catch(() => false)) return true;
+    if (page.url().includes("/agent/chat") && (await hasActiveChat(page))) return true;
+    if (await page.getByRole("button", { name: /General chat/i }).first().isVisible().catch(() => false)) {
+      if (await composerReady(page)) return true;
+    }
     await sleep(1500);
   }
   console.log("     Init timeout — navegar para chat…");
   await page.goto(`${FLOW}/agent/chat`, { waitUntil: "load", timeout: 90_000 }).catch(() => {});
   await sleep(2000);
-  await escapeStuckInit(page);
+  if (await isWelcomeNoAgent(page)) {
+    console.log("     Chat em Welcome — forçar wizard…");
+    await startAgentWizard(page);
+  } else {
+    await escapeStuckInit(page);
+  }
   return true;
 }
 
@@ -1109,12 +1206,13 @@ async function runAgentInit(page, agent = AGENT) {
   await sleep(1000);
 
   console.log("     Aguardar chat…");
-  await waitPastInitializing(page, 45_000);
+  await waitPastInitializing(page, 60_000);
   await page.waitForURL(/\/agent\/chat/, { timeout: 30_000 }).catch(async () => {
     await page.goto(`${FLOW}/agent/chat`, { waitUntil: "load", timeout: 90_000 });
   });
   await sleep(1000);
   await escapeStuckInit(page);
+  await ensureAgentOnChat(page, agent);
   await ensureChatLoaded(page, "pós-Generate Soul");
   await openGeneralChat(page);
   await waitForComposer(page, 60_000);
@@ -1122,6 +1220,7 @@ async function runAgentInit(page, agent = AGENT) {
 
 async function isChatBlank(page) {
   if (await isStuckInitializing(page)) return true;
+  if (await isWelcomeNoAgent(page)) return true;
   return page.evaluate(() => {
     const text = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
     const hasGeneral = [...document.querySelectorAll("button")].some((b) =>
@@ -1141,9 +1240,18 @@ async function ensureChatLoaded(page, label = "chat") {
     await dismissPromoOverlay(page);
     await escapeStuckInit(page);
 
+    if (await isWelcomeNoAgent(page)) {
+      console.log(`     Welcome sem agente — recuperar ${label} (${attempt}/10)…`);
+      await startAgentWizard(page);
+      await sleep(1500);
+      continue;
+    }
+
+    if (await hasActiveChat(page)) return true;
+
     if (!(await isChatBlank(page))) {
       const ok =
-        (await page.getByText(/General chat/i).first().isVisible().catch(() => false)) ||
+        (await page.getByRole("button", { name: /General chat/i }).first().isVisible().catch(() => false)) &&
         (await composerReady(page));
       if (ok) return true;
     }
@@ -1169,6 +1277,7 @@ async function getComposerLocator(page) {
 }
 
 async function composerReady(page) {
+  if (await isWelcomeNoAgent(page)) return false;
   return page.evaluate(() => {
     const el = document.querySelector(
       '[contenteditable="true"].tiptap, [contenteditable="true"][data-placeholder*="Tell"]'
@@ -1234,9 +1343,20 @@ async function fillComposer(page, locator, text) {
 }
 
 async function openGeneralChat(page) {
+  if (await isWelcomeNoAgent(page)) {
+    throw new Error("General chat indisponível — conta em Welcome (agente não criado).");
+  }
   await ensureChatLoaded(page, "General chat").catch(() => {});
 
-  if (await composerReady(page)) return true;
+  if (!(await hasActiveChat(page)) && !(await composerReady(page))) {
+    throw new Error("Chat sem composer activo.");
+  }
+
+  if (await composerReady(page)) {
+    console.log("     General chat aberto ✅");
+    await scrollComposerIntoView(page);
+    return true;
+  }
 
   await ensureWafCleared(page);
 
@@ -1246,7 +1366,7 @@ async function openGeneralChat(page) {
     await sleep(800);
     await dismissPromoOverlay(page);
 
-    if (await composerReady(page)) {
+    if (await hasActiveChat(page) || (await composerReady(page))) {
       console.log("     General chat aberto ✅");
       await scrollComposerIntoView(page);
       return true;
@@ -1254,15 +1374,17 @@ async function openGeneralChat(page) {
 
     try {
       await waitForComposer(page, 8_000);
-      console.log("     General chat aberto ✅");
-      await scrollComposerIntoView(page);
-      return true;
+      if (await hasActiveChat(page)) {
+        console.log("     General chat aberto ✅");
+        await scrollComposerIntoView(page);
+        return true;
+      }
     } catch {
       /* retry */
     }
   }
 
-  throw new Error("General chat não abriu — WAF captcha ou clique falhou.");
+  throw new Error("General chat não abriu — agente em falta ou WAF captcha.");
 }
 
 async function findChatInput(page) {
@@ -1420,7 +1542,13 @@ async function callProspilot(page, slot) {
   if (!page.url().includes("/agent/chat")) {
     await ensureAgentChat(page);
   } else {
+    if (await isWelcomeNoAgent(page)) {
+      throw new Error("ProsPilot bloqueado — Welcome sem agente (falso chat).");
+    }
     await openGeneralChat(page);
+  }
+  if (!(await hasActiveChat(page))) {
+    throw new Error("ProsPilot bloqueado — chat/composer inactivo.");
   }
   await sleep(400);
   await sendProspilotMessage(page, slot);
