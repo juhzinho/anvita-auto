@@ -14,7 +14,8 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { mkdirSync, writeFileSync, existsSync, readFileSync, appendFileSync, readdirSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { mkdirSync, writeFileSync, existsSync, readFileSync, appendFileSync, readdirSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -440,6 +441,7 @@ class BlackScreenGuard {
     if (await isRegisterFlowPage(this.page).catch(() => false)) return;
     if (!url.includes("/agent/chat") && !url.includes("/agent-init")) return;
     if (byoaInProgress.get(this.page)) return;
+    if (isChatBusy(this.page)) return;
 
     if (await hasActiveChat(this.page)) {
       this._postInitStuckSince = 0;
@@ -465,15 +467,16 @@ class BlackScreenGuard {
       return;
     }
 
-    // Chat abriu mas composer (input) em falta
+    // Chat abriu mas composer (input) em falta — nunca reload (SPA repõe sozinha)
     if (url.includes("/agent/chat") && (await isComposerMissing(this.page).catch(() => false))) {
+      if (isProspilotPhase(this.page) || (await chatHasMessages(this.page).catch(() => false))) return;
       if (Date.now() - this._lastBlackAt < GUARD_BLACK_COOLDOWN_MS) return;
       this.recovering = true;
       this._lastBlackAt = Date.now();
       try {
         if (this.slot) slotLog(this.slot, "⚡ Guard IA: composer em falta — activar input");
         else console.log("     ⚡ Guard IA: composer em falta — activar input");
-        await ensureComposerReady(this.page, this.slot, 15_000);
+        await wakeComposer(this.page, this.slot, 8000);
       } finally {
         this.recovering = false;
       }
@@ -483,6 +486,7 @@ class BlackScreenGuard {
     // Pós-init: título "Initialize Your Agent" + tela preta
     const postInit = await probePostInitBlack(this.page).catch(() => ({ stuck: false }));
     if (postInit.stuck) {
+      if (isProspilotPhase(this.page) || (await chatHasMessages(this.page).catch(() => false))) return;
       if (!this._postInitStuckSince) this._postInitStuckSince = Date.now();
       const stuckMs = Date.now() - this._postInitStuckSince;
       if (stuckMs < POST_INIT_GRACE_MS) return;
@@ -507,6 +511,7 @@ class BlackScreenGuard {
     this._postInitStuckSince = 0;
 
     if (!h.blackScreen) return;
+    if (isProspilotPhase(this.page) || (await chatHasMessages(this.page).catch(() => false))) return;
     if (Date.now() - this._lastBlackAt < GUARD_BLACK_COOLDOWN_MS) return;
     if (this._blackReloads >= POST_INIT_MAX_RELOADS) return;
 
@@ -529,7 +534,60 @@ class BlackScreenGuard {
 const pageGuards = new WeakMap();
 /** Evita Guard + FlowBrain a chamarem runFullByoaWizard em paralelo (loop infinito). */
 const byoaInProgress = new WeakMap();
+/** Pós-envio: composer some brevemente — Guard não deve dar reload. */
+const chatBusyUntil = new WeakMap();
+/** Fase @prospilot activa — bloqueia reloads no chat. */
+const prospilotPhaseActive = new WeakMap();
 const postInitWatchdogs = new WeakMap();
+
+function setChatBusy(page, ms = 20_000) {
+  chatBusyUntil.set(page, Date.now() + ms);
+}
+
+function isChatBusy(page) {
+  const until = chatBusyUntil.get(page);
+  return !!until && Date.now() < until;
+}
+
+function isProspilotPhase(page) {
+  return !!prospilotPhaseActive.get(page) || isChatBusy(page);
+}
+
+async function chatHasMessages(page) {
+  return page.evaluate(() => {
+    const text = document.body?.innerText || "";
+    return (
+      /@prospilot/i.test(text) ||
+      /dedicated Anvita On smart concierge/i.test(text) ||
+      /Tell me the result you want/i.test(text) ||
+      /Hi, I'm MeuAgentePro/i.test(text) ||
+      /AI-generated\. Please verify/i.test(text)
+    );
+  });
+}
+
+/** Headless VPS: composer demora — sidebar General chat + conteúdo = agente criado. */
+async function hasChatUiReady(page) {
+  return page.evaluate(() => {
+    const text = document.body?.innerText || "";
+    const hasGeneral = [...document.querySelectorAll("button")].some((b) =>
+      /general chat/i.test(b.textContent || "")
+    );
+    if (!hasGeneral) return false;
+    const composer = document.querySelector(
+      '[contenteditable="true"].tiptap, [contenteditable="true"][data-placeholder*="Tell"]'
+    );
+    const composerOk =
+      composer &&
+      composer.getBoundingClientRect().width > 40 &&
+      composer.getBoundingClientRect().height > 8;
+    return (
+      composerOk ||
+      /dedicated Anvita On smart concierge|Tell me the result|MeuAgentePro/i.test(text) ||
+      (text.length > 180 && /General chat/i.test(text))
+    );
+  });
+}
 
 async function probePostInitBlack(page) {
   return page.evaluate(() => {
@@ -597,6 +655,7 @@ class PostInitBlackWatchdog {
       return;
     }
     if (byoaInProgress.get(this.page)) return;
+    if (isChatBusy(this.page)) return;
 
     if (await hasActiveChat(this.page)) {
       this.stuckSince = 0;
@@ -613,6 +672,7 @@ class PostInitBlackWatchdog {
     if (!this.stuckSince) this.stuckSince = Date.now();
     const stuckMs = Date.now() - this.stuckSince;
     if (stuckMs < POST_INIT_GRACE_MS) return;
+    if (isProspilotPhase(this.page) || (await chatHasMessages(this.page).catch(() => false))) return;
     if (Date.now() - this.lastReload < POST_INIT_RELOAD_COOLDOWN_MS) return;
     if (this.reloadCount >= POST_INIT_MAX_RELOADS) return;
 
@@ -744,7 +804,11 @@ class FlowBrain {
     if (state.initBody || state.hasInitializing || state.phase === "stuck-init") return "stuck-init";
     if (state.hasAddAgentModal) return "byoa-modal";
     if (state.phase === "agent-wizard" || state.hasWizard) return "wizard";
-    if (state.phase === "chat" && !state.hasComposer) return "chat-empty";
+    if (state.phase === "chat" && !state.hasComposer) {
+      if (isProspilotPhase(this.page)) return "ok";
+      return "chat-empty";
+    }
+    if (isProspilotPhase(this.page) && state.url?.includes("/agent/chat")) return "ok";
     return "reload";
   }
 
@@ -825,6 +889,11 @@ class FlowBrain {
         await sleep(1500);
         return true;
       case "reload":
+        if (isProspilotPhase(page) || page.url().includes("/agent/chat")) {
+          await clickGeneralChat(page).catch(() => {});
+          await sleep(1500);
+          return true;
+        }
         await page.reload({ waitUntil: "load", timeout: 90_000 }).catch(() => {});
         return true;
       default:
@@ -834,6 +903,7 @@ class FlowBrain {
 
   async ensureHealthy(agent, label = "page", maxRounds = BLACK_RECOVER_MAX) {
     if (await isRegisterFlowPage(this.page) || vpsNoAutoRecover()) return this.scan();
+    if (isProspilotPhase(this.page)) return this.scan();
     for (let i = 0; i < maxRounds; i++) {
       const state = await this.scan();
       if (state.loading) {
@@ -859,6 +929,10 @@ class FlowBrain {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (await checkFn()) return true;
+      if (isProspilotPhase(this.page)) {
+        await sleep(BLACK_SCREEN_POLL_MS);
+        continue;
+      }
       const state = await this.scan();
       if (state.loading) {
         await sleep(1500);
@@ -1816,6 +1890,22 @@ async function runFullByoaWizard(page, agent = AGENT, slot = 0) {
     slotLog(slot, `🤖 BYOA completo — ronda ${round}/10`);
 
     await dismissPromoOverlay(page).catch(() => {});
+
+    const generalSidebar = await page
+      .getByRole("button", { name: /General chat/i })
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (generalSidebar) {
+      await clickGeneralChat(page).catch(() => {});
+      await waitForChatAfterGenerateSoul(page, slot, agent);
+      if (await hasActiveChat(page)) return true;
+      await recoverPostInitBlack(page, slot, agent).catch(() => {});
+      if (await hasActiveChat(page)) return true;
+      await sleep(1000);
+      continue;
+    }
+
     await clickAddAgentReliable(page);
     await sleep(600);
     await resolveAddAgentModal(page);
@@ -1924,7 +2014,10 @@ async function hasActiveChat(page) {
     .first()
     .isVisible()
     .catch(() => false);
-  return generalVisible && (await composerReady(page));
+  if (!generalVisible) return false;
+  if (await composerReady(page)) return true;
+  if (await chatHasMessages(page)) return true;
+  return hasChatUiReady(page);
 }
 
 async function ensureAgentOnChat(page, agent = AGENT, slot = 0) {
@@ -1955,9 +2048,10 @@ async function recoverPostInitBlack(page, slot = 0, agent = AGENT) {
 
 async function waitForChatAfterGenerateSoul(page, slot = 0, agent = AGENT) {
   slotLog(slot, "     Aguardar chat pós-Generate Soul…");
-  const deadline = Date.now() + 45_000;
+  const deadline = Date.now() + (process.env.ANVITA_VPS === "1" ? 120_000 : 45_000);
   let blackSince = 0;
   let reloads = 0;
+  const maxReloads = process.env.ANVITA_VPS === "1" ? 6 : 3;
 
   while (Date.now() < deadline) {
     if (await hasActiveChat(page)) return true;
@@ -1971,13 +2065,15 @@ async function waitForChatAfterGenerateSoul(page, slot = 0, agent = AGENT) {
 
     if (url.includes("/agent/chat") && (await isPostInitBlack(page))) {
       if (!blackSince) blackSince = Date.now();
-      if (Date.now() - blackSince >= POST_INIT_GRACE_MS && reloads < 3) {
+      if (Date.now() - blackSince >= POST_INIT_GRACE_MS && reloads < maxReloads) {
         reloads += 1;
-        slotLog(slot, `     Tela preta pós-init — reload ${reloads}/3`);
+        slotLog(slot, `     Tela preta pós-init — reload ${reloads}/${maxReloads}`);
         await page.reload({ waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
         await sleep(800);
         await clickGeneralChat(page).catch(() => {});
         blackSince = 0;
+      } else if (reloads >= 2) {
+        await recoverPostInitBlack(page, slot, agent).catch(() => {});
       }
       await sleep(400);
       continue;
@@ -1988,6 +2084,8 @@ async function waitForChatAfterGenerateSoul(page, slot = 0, agent = AGENT) {
       await sleep(600);
     }
 
+    await clickGeneralChat(page).catch(() => {});
+    await wakeComposer(page, slot, 2000).catch(() => {});
     blackSince = 0;
     await sleep(400);
   }
@@ -2174,37 +2272,43 @@ async function isComposerMissing(page) {
   });
 }
 
-async function ensureComposerReady(page, slot = 0, timeoutMs = 60_000) {
+async function wakeComposer(page, slot = 0, timeoutMs = 15_000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     if (await composerReady(page)) return true;
-    if (await isComposerMissing(page)) {
-      slotLog(slot, "     Composer em falta — activar input…");
-      await clickGeneralChat(page).catch(() => {});
-      await scrollComposerIntoView(page);
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
-      await sleep(1200);
-      if (await composerReady(page)) return true;
-      slotLog(slot, "     Reload para carregar composer…");
-      await page.reload({ waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
-      await sleep(1500);
-      await clickGeneralChat(page).catch(() => {});
-    }
-    await sleep(800);
+    await clickGeneralChat(page).catch(() => {});
+    await scrollComposerIntoView(page);
+    await dismissPromoOverlay(page);
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+    await sleep(1500);
   }
   return composerReady(page);
 }
 
+async function ensureComposerReady(page, slot = 0, timeoutMs = 60_000) {
+  // Nunca reload em /agent/chat — o SPA repõe o composer sozinho após enviar mensagem
+  return wakeComposer(page, slot, timeoutMs);
+}
+
+async function focusGeneralChat(page, slot = 0) {
+  await clickGeneralChat(page).catch(() => {});
+  await dismissPromoOverlay(page);
+  await scrollComposerIntoView(page);
+}
+
 async function composerReady(page) {
   if (await isWelcomeNoAgent(page)) return false;
-  return page.evaluate(() => {
+  const minW = process.env.ANVITA_VPS === "1" ? 40 : 80;
+  const minH = process.env.ANVITA_VPS === "1" ? 8 : 15;
+  return page.evaluate(({ minW, minH, vps }) => {
     const el = document.querySelector(
       '[contenteditable="true"].tiptap, [contenteditable="true"][data-placeholder*="Tell"]'
     );
     if (!el) return false;
     const r = el.getBoundingClientRect();
-    return r.width > 80 && r.height > 15 && el.offsetParent !== null;
-  });
+    const visible = vps ? r.width > minW && r.height > minH : r.width > minW && r.height > minH && el.offsetParent !== null;
+    return visible;
+  }, { minW, minH, vps: process.env.ANVITA_VPS === "1" });
 }
 
 async function waitForComposer(page, timeoutMs = 90_000, slot = 0, agent = AGENT) {
@@ -2254,20 +2358,20 @@ async function fillComposer(page, locator, text) {
   }, text);
 }
 
-async function openGeneralChat(page, slot = 0) {
+async function openGeneralChat(page, slot = 0, { log = true } = {}) {
   if (await isWelcomeNoAgent(page)) {
     throw new Error("General chat indisponível — conta em Welcome (agente não criado).");
   }
   await ensureChatLoaded(page, "General chat", slot).catch(() => {});
 
   for (let attempt = 0; attempt < 6; attempt++) {
-    if (attempt === 0) console.log("     General chat…");
+    if (log && attempt === 0) console.log("     General chat…");
     await clickGeneralChat(page).catch(() => {});
     await sleep(800);
     await dismissPromoOverlay(page);
 
-    if (await ensureComposerReady(page, slot, 20_000)) {
-      console.log("     General chat aberto ✅");
+    if (await wakeComposer(page, slot, 20_000)) {
+      if (log) console.log("     General chat aberto ✅");
       await scrollComposerIntoView(page);
       return true;
     }
@@ -2277,9 +2381,11 @@ async function openGeneralChat(page, slot = 0) {
 }
 
 async function findChatInput(page, slot = 0) {
-  await openGeneralChat(page);
+  if (!(await composerReady(page))) {
+    await openGeneralChat(page, slot);
+  }
   await ensureWafCleared(page);
-  const ok = await ensureComposerReady(page, slot, 90_000);
+  const ok = await wakeComposer(page, slot, 30_000);
   if (!ok) throw new Error("Composer não apareceu — impossível enviar mensagem.");
   return getComposerLocator(page);
 }
@@ -2372,11 +2478,37 @@ async function clearComposer(page) {
   });
 }
 
+async function clickComposerSend(page) {
+  const sent = await page.evaluate(() => {
+    const composer = document.querySelector(
+      '[contenteditable="true"].tiptap, [contenteditable="true"][data-placeholder*="Tell"]'
+    );
+    if (!composer) return false;
+    let node = composer.parentElement;
+    for (let i = 0; i < 8 && node; i++) {
+      const btn = [...node.querySelectorAll("button")].find((b) => {
+        if (b.disabled) return false;
+        const label = (b.getAttribute("aria-label") || b.textContent || "").toLowerCase();
+        return /send|enviar|submit/.test(label) || !!b.querySelector("svg");
+      });
+      if (btn) {
+        btn.click();
+        return true;
+      }
+      node = node.parentElement;
+    }
+    return false;
+  });
+  if (sent) return true;
+  return clickText(page, "Send", "Enviar");
+}
+
 async function sendProspilotMessage(page, slot, agent = AGENT) {
   const tag = slot ? `[P${slot}] ` : "";
   const text = PROSPILOT_CMD_TEXT;
   const b = flowBrain(page, slot);
 
+  setChatBusy(page, 25_000);
   await b.ensureHealthy(agent, "pré-prospilot", 8).catch(() => {});
   await openGeneralChat(page, slot);
   await ensureWafCleared(page);
@@ -2386,13 +2518,14 @@ async function sendProspilotMessage(page, slot, agent = AGENT) {
   for (let attempt = 1; attempt <= 5; attempt++) {
     slotLog(slot, attempt === 1 ? "Enviar @prospilot…" : `Reenviar @prospilot (${attempt}/5)…`);
 
-    if (!(await ensureComposerReady(page, slot, 30_000))) {
-      slotLog(slot, "     ⚠ Composer indisponível — recuperar…");
-      await recoverPostInitBlack(page, slot, agent).catch(() => {});
+    if (!(await wakeComposer(page, slot, 30_000))) {
+      slotLog(slot, "     ⚠ Composer indisponível — aguardar…");
+      await focusGeneralChat(page, slot);
+      await sleep(2000);
       continue;
     }
 
-    const input = await findChatInput(page, slot);
+    const input = await getComposerLocator(page);
     await clearComposer(page);
     await fillComposer(page, input, text);
     await sleep(350);
@@ -2408,10 +2541,11 @@ async function sendProspilotMessage(page, slot, agent = AGENT) {
       continue;
     }
 
-    const clicked = await clickText(page, "Send", "Enviar", "Submit");
+    const clicked = await clickComposerSend(page);
     if (!clicked) {
-      await page.keyboard.press("Enter");
+      await page.keyboard.press("Control+Enter");
     }
+    setChatBusy(page, 30_000);
     await sleep(1800);
 
     const after = await readChatMetrics(page);
@@ -2423,8 +2557,7 @@ async function sendProspilotMessage(page, slot, agent = AGENT) {
     }
 
     slotLog(slot, "     ⚠ Mensagem não apareceu no chat — retry…");
-    await clickGeneralChat(page).catch(() => {});
-    await openGeneralChat(page, slot).catch(() => {});
+    await focusGeneralChat(page, slot);
   }
 
   throw new Error("Mensagem @prospilot não confirmada no chat após 5 tentativas.");
@@ -2449,7 +2582,7 @@ async function waitForProspilotResponse(page, slot, agent = AGENT, sendInfo = {}
     polls += 1;
 
     if (polls === 1 || polls % 5 === 0) {
-      await openGeneralChat(page).catch(() => {});
+      await focusGeneralChat(page, slot).catch(() => {});
     }
 
     let s;
@@ -2488,7 +2621,7 @@ async function waitForProspilotResponse(page, slot, agent = AGENT, sendInfo = {}
     if (s.silent && sinceActivity > PROSPILOT_SILENT_MS && resends < MAX_RESEND) {
       resends += 1;
       console.log(`${tag}⚠ Chat silencioso — reenviar (${resends}/${MAX_RESEND})…`);
-      await openGeneralChat(page).catch(() => {});
+      await focusGeneralChat(page, slot).catch(() => {});
       const info = await sendProspilotMessage(page, slot, agent);
       sentAt = info.sentAt;
       lastActivity = Date.now();
@@ -2536,20 +2669,29 @@ async function waitForProspilotResponse(page, slot, agent = AGENT, sendInfo = {}
 }
 
 async function callProspilot(page, slot, agent = AGENT) {
-  await requireActiveAgent(page, slot, agent);
-  if (!page.url().includes("/agent/chat")) {
-    await ensureAgentChat(page);
-  }
-  if (!(await ensureComposerReady(page, slot, 60_000))) {
-    await recoverPostInitBlack(page, slot, agent);
-  }
-  if (!(await ensureComposerReady(page, slot, 30_000))) {
-    throw new Error("ProsPilot bloqueado — composer não carregou.");
-  }
+  pausePageGuard(page);
+  prospilotPhaseActive.set(page, true);
+  setChatBusy(page, RESPONSE_WAIT_MS + 60_000);
+  try {
+    await requireActiveAgent(page, slot, agent);
+    if (!page.url().includes("/agent/chat")) {
+      await ensureAgentChat(page);
+    }
+    if (!(await wakeComposer(page, slot, 60_000))) {
+      await recoverPostInitBlack(page, slot, agent);
+    }
+    if (!(await wakeComposer(page, slot, 30_000))) {
+      throw new Error("ProsPilot bloqueado — composer não carregou.");
+    }
 
-  await openGeneralChat(page, slot);
-  const sendInfo = await sendProspilotMessage(page, slot, agent);
-  await waitForProspilotResponse(page, slot, agent, sendInfo);
+    await openGeneralChat(page, slot);
+    const sendInfo = await sendProspilotMessage(page, slot, agent);
+    await waitForProspilotResponse(page, slot, agent, sendInfo);
+  } finally {
+    prospilotPhaseActive.delete(page);
+    chatBusyUntil.delete(page);
+    resumePageGuard(page);
+  }
 }
 
 const STATE_FILE = path.join(__dirname, "..", ".anvita-auto", "storage-state.json");
@@ -3014,11 +3156,154 @@ async function sequentialBatchMain(count = 5) {
   if (ok < count) process.exitCode = 1;
 }
 
+function killOtherPoolProcesses() {
+  if (process.env.ANVITA_POOL_NO_KILL === "1") {
+    console.log("ANVITA_POOL_NO_KILL=1 — pool anterior mantém-se (browsers terminam jobs).");
+    return;
+  }
+  const myPid = process.pid;
+  try {
+    if (process.platform === "win32") {
+      const out = execSync(
+        `powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \\"Name='node.exe'\\" | Where-Object { $_.CommandLine -match 'run-anvita-auto-pool' -and $_.ProcessId -ne ${myPid} } | ForEach-Object { $_.ProcessId }"`,
+        { encoding: "utf8", stdio: ["pipe", "pipe", "ignore"] }
+      ).trim();
+      for (const line of out.split(/\r?\n/)) {
+        const pid = parseInt(line.trim(), 10);
+        if (pid > 0) {
+          console.log(`Parar pool concorrente (PID ${pid})…`);
+          try {
+            execSync(`taskkill /PID ${pid} /F /T`, { stdio: "ignore" });
+          } catch {
+            /* já morreu */
+          }
+        }
+      }
+    } else {
+      const out = execSync("pgrep -f run-anvita-auto-pool || true", {
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "ignore"],
+      }).trim();
+      for (const line of out.split(/\r?\n/)) {
+        const pid = parseInt(line.trim(), 10);
+        if (pid > 0 && pid !== myPid) {
+          console.log(`Parar pool concorrente (PID ${pid})…`);
+          try {
+            process.kill(pid, "SIGTERM");
+          } catch {
+            /* já morreu */
+          }
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
 async function poolMain(total = 100, workers = 2) {
   const outDir = path.join(__dirname, "..", ".anvita-auto");
   mkdirSync(outDir, { recursive: true });
   const resultsPath = path.join(outDir, "pool-results.json");
   const logPath = path.join(outDir, "pool-run.log");
+  const poolLockPath = path.join(outDir, "pool.lock");
+  const activeWorkersPath = path.join(outDir, "pool-active-workers");
+  const poolResultsLockPath = path.join(outDir, "pool-results.lock");
+
+  function getActiveWorkerLimit() {
+    try {
+      if (existsSync(activeWorkersPath)) {
+        const n = parseInt(readFileSync(activeWorkersPath, "utf8").trim(), 10);
+        if (n > 0) return Math.min(n, workers);
+      }
+    } catch {
+      /* ignore */
+    }
+    return workers;
+  }
+
+  async function withPoolFileLock(fn) {
+    const start = Date.now();
+    while (Date.now() - start < 120_000) {
+      try {
+        writeFileSync(poolResultsLockPath, String(process.pid), { flag: "wx" });
+        break;
+      } catch {
+        await sleep(150 + Math.random() * 100);
+      }
+    }
+    try {
+      return await fn();
+    } finally {
+      try {
+        unlinkSync(poolResultsLockPath);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  async function reloadResultsFromDisk() {
+    if (!existsSync(resultsPath)) return;
+    try {
+      results.length = 0;
+      results.push(...JSON.parse(readFileSync(resultsPath, "utf8")));
+      successCount = results.filter((r) => r.ok).length;
+    } catch {
+      /* ignore */
+    }
+  }
+
+  killOtherPoolProcesses();
+  await sleep(1500);
+
+  if (existsSync(poolLockPath)) {
+    try {
+      const prev = JSON.parse(readFileSync(poolLockPath, "utf8"));
+      if (prev?.pid && prev.pid !== process.pid) {
+        if (process.env.ANVITA_POOL_NO_KILL === "1") {
+          console.log(`Pool anterior activo (PID ${prev.pid}) — a correr em paralelo até terminar.`);
+        } else {
+          console.log(`Parar pool anterior (PID ${prev.pid}, ${prev.workers} workers)…`);
+          if (process.platform === "win32") {
+            execSync(`taskkill /PID ${prev.pid} /F /T`, { stdio: "ignore" });
+          } else {
+            try {
+              process.kill(prev.pid, "SIGTERM");
+            } catch {
+              /* já morreu */
+            }
+          }
+          await sleep(2500);
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  writeFileSync(
+    poolLockPath,
+    JSON.stringify({ pid: process.pid, workers, total, started: new Date().toISOString() })
+  );
+  const releasePoolLock = () => {
+    try {
+      if (existsSync(poolLockPath)) {
+        const cur = JSON.parse(readFileSync(poolLockPath, "utf8"));
+        if (cur?.pid === process.pid) unlinkSync(poolLockPath);
+      }
+    } catch {
+      /* ignore */
+    }
+  };
+  process.on("exit", releasePoolLock);
+  process.on("SIGINT", () => {
+    releasePoolLock();
+    process.exit(130);
+  });
+  process.on("SIGTERM", () => {
+    releasePoolLock();
+    process.exit(143);
+  });
 
   const results = existsSync(resultsPath)
     ? JSON.parse(readFileSync(resultsPath, "utf8"))
@@ -3039,10 +3324,15 @@ async function poolMain(total = 100, workers = 2) {
 
   let lock = Promise.resolve();
   const withLock = (fn) => {
-    const next = lock.then(fn, fn);
+    const next = lock.then(() => withPoolFileLock(fn), () => withPoolFileLock(fn));
     lock = next.catch(() => {});
     return next;
   };
+
+  const activeLimit = getActiveWorkerLimit();
+  if (activeLimit < workers) {
+    console.log(`Limite activo: ${activeLimit} workers (W${activeLimit + 1}–W${workers} terminam após job actual)\n`);
+  }
 
   async function takeMailbox(workerId, targetNum) {
     return withLock(async () => {
@@ -3052,19 +3342,22 @@ async function poolMain(total = 100, workers = 2) {
   }
 
   const persist = (entry) =>
-    withLock(() => {
+    withLock(async () => {
+      await reloadResultsFromDisk();
       results.push(entry);
       writeFileSync(resultsPath, JSON.stringify(results, null, 2));
       appendFileSync(
         logPath,
         `${new Date().toISOString()} ${entry.ok ? "OK" : "FAIL"} #${entry.accountNum ?? "?"} attempt=${entry.attemptId} ${entry.email || entry.error || ""}\n`
       );
+      successCount = results.filter((r) => r.ok).length;
     });
 
   async function acquireJob(workerId) {
     for (let wait = 0; wait < 120; wait++) {
       let job = null;
-      await withLock(() => {
+      await withLock(async () => {
+        await reloadResultsFromDisk();
         if (successCount >= total) return;
         const targetNum = successCount + inFlight.size + 1;
         if (targetNum > total) return;
@@ -3193,6 +3486,11 @@ async function poolMain(total = 100, workers = 2) {
   async function workerLoop(workerId, workerBrowser) {
     await sleep((workerId - 1) * PARALLEL_STAGGER_MS);
     while (true) {
+      const active = getActiveWorkerLimit();
+      if (workerId > active) {
+        console.log(`[W${workerId}] Limite ${active} workers — terminar (job concluído)`);
+        break;
+      }
       try {
         const again = await runOneAccount(workerId, workerBrowser);
         if (!again) break;
@@ -3201,8 +3499,13 @@ async function poolMain(total = 100, workers = 2) {
         await workerBrowser.restart().catch(() => {});
         await sleep(5000);
       }
+      if (workerId > getActiveWorkerLimit()) {
+        console.log(`[W${workerId}] Limite reduzido — terminar após conclusão`);
+        break;
+      }
       let done;
-      await withLock(() => {
+      await withLock(async () => {
+        await reloadResultsFromDisk();
         done = successCount >= total;
       });
       if (done) break;
