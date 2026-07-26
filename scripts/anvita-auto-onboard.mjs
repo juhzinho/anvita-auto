@@ -9,7 +9,8 @@
  * VPS Windows: npm run anvita:vps  (Edge headless por default)
  * VPS Linux:   npm run anvita:vps  (Chromium headless por default)
  * Robustez: auto-recuperação por fase, browser reutilizado no pool, screenshots em falhas.
- * ANVITA_POOL_RETRIES=8 ANVITA_BROWSER_RESTART_EVERY=12 ANVITA_STUCK_MS=90000
+ * FlowBrain: detecção tela preta ~600ms, recuperação inteligente por fase.
+ * ANVITA_BLACK_POLL_MS=600 ANVITA_BLACK_RECOVER_MAX=14
  */
 
 import { randomBytes } from "node:crypto";
@@ -43,6 +44,8 @@ const OTP_TIMEOUT_MS = Number(process.env.ANVITA_OTP_TIMEOUT_MS || (process.env.
 const POOL_MAX_ROUNDS = Math.max(3, Number(process.env.ANVITA_POOL_RETRIES || 8));
 const BROWSER_RESTART_EVERY = Math.max(5, Number(process.env.ANVITA_BROWSER_RESTART_EVERY || 12));
 const STUCK_PHASE_MS = Number(process.env.ANVITA_STUCK_MS || 90_000);
+const BLACK_SCREEN_POLL_MS = Number(process.env.ANVITA_BLACK_POLL_MS || 600);
+const BLACK_RECOVER_MAX = Number(process.env.ANVITA_BLACK_RECOVER_MAX || 14);
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -125,6 +128,12 @@ async function smartRecover(page, slot, situation, errMsg) {
     return false;
   }
 
+  const health = await probePageHealth(page).catch(() => ({}));
+  if (health.blackScreen || health.initTitle) {
+    await flowBrain(page, slot).execute("black", AGENT);
+    return true;
+  }
+
   if (situation?.hasWaf || situation?.hasCaptcha || /captcha|WAF/i.test(msg)) {
     await ensureWafCleared(page);
     await solveCaptchaIfAny(page).catch(() => {});
@@ -195,6 +204,196 @@ async function runWithRecovery(page, slot, label, fn, maxAttempts = 4) {
     }
   }
   throw lastErr;
+}
+
+async function probePageHealth(page) {
+  if (page.isClosed()) return { closed: true, blackScreen: true, healthy: false };
+  return page
+    .evaluate(() => {
+      const text = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
+      const title = document.title || "";
+      const buttons = document.querySelectorAll("button").length;
+      const inputs = document.querySelectorAll('input, textarea, [contenteditable="true"]').length;
+      const root = document.querySelector("#root, #__next, main, [class*='layout']");
+      const rootText = (root?.innerText || "").replace(/\s+/g, " ").trim();
+      const bg = getComputedStyle(document.body).backgroundColor || "";
+      const isDarkBg = /rgb\(\s*0,\s*0,\s*0\)|rgb\(17|rgba\(0,\s*0,\s*0|#000/i.test(bg);
+      const hasGeneral = [...document.querySelectorAll("button")].some((b) =>
+        /general chat/i.test(b.textContent || "")
+      );
+      const composer = document.querySelector(
+        '[contenteditable="true"].tiptap, [contenteditable="true"][data-placeholder*="Tell"]'
+      );
+      const composerOk =
+        composer &&
+        composer.getBoundingClientRect().width > 80 &&
+        composer.getBoundingClientRect().height > 15 &&
+        composer.offsetParent !== null;
+      const welcome = /Welcome to Anvita Flow|Add your personal steward agent/i.test(text);
+      const initTitle = /Initialize Your Agent|Initializing/i.test(title);
+      const initBody = /Initializing|Shaping the soul/i.test(text);
+      const addAgentBtn = [...document.querySelectorAll("button")].some((b) =>
+        /^Add Agent$/i.test((b.textContent || "").trim())
+      );
+      const noUi = buttons < 4 && inputs < 2 && text.length < 100;
+      const blackScreen =
+        (isDarkBg && text.length < 180 && !composerOk && !hasGeneral) ||
+        (initTitle && !composerOk && !hasGeneral && text.length < 250) ||
+        (noUi && !welcome && !addAgentBtn && text.length < 80) ||
+        (rootText.length < 40 && buttons < 3 && !composerOk);
+      return {
+        textLen: text.length,
+        rootTextLen: rootText.length,
+        buttons,
+        isDarkBg,
+        title,
+        blackScreen,
+        welcome,
+        initTitle,
+        initBody,
+        addAgentBtn,
+        hasGeneral,
+        hasComposer: composerOk,
+        healthy: hasGeneral && composerOk,
+      };
+    })
+    .catch(() => ({ blackScreen: true, healthy: false, textLen: 0 }));
+}
+
+class FlowBrain {
+  constructor(page, slot = 0) {
+    this.page = page;
+    this.slot = slot;
+    this.counts = {};
+  }
+
+  log(msg) {
+    if (this.slot) slotLog(this.slot, `🧠 ${msg}`);
+    else console.log(`     🧠 ${msg}`);
+  }
+
+  bump(action) {
+    this.counts[action] = (this.counts[action] || 0) + 1;
+    return this.counts[action];
+  }
+
+  async scan() {
+    const health = await probePageHealth(this.page);
+    const situation = await analyzePageSituation(this.page).catch(() => ({}));
+    return { ...health, ...situation };
+  }
+
+  pickAction(state) {
+    if (state.closed) return "browser-dead";
+    if (state.healthy) return "ok";
+    if (state.hasWaf || state.hasCaptcha) return "waf";
+    if (state.blackScreen || state.initTitle || (state.textLen < 60 && !state.welcome)) return "black";
+    if (state.welcome || state.hasWelcomeNoAgent || state.addAgentBtn) return "welcome";
+    if (state.initBody || state.hasInitializing || state.phase === "stuck-init") return "stuck-init";
+    if (state.hasAddAgentModal) return "byoa-modal";
+    if (state.phase === "agent-wizard" || state.hasWizard) return "wizard";
+    if (state.phase === "chat" && !state.hasComposer) return "chat-empty";
+    return "reload";
+  }
+
+  async execute(action, agent) {
+    const n = this.bump(action);
+    const page = this.page;
+
+    switch (action) {
+      case "ok":
+        return true;
+      case "waf":
+        this.log("WAF/captcha — resolver");
+        await ensureWafCleared(page);
+        await solveCaptchaIfAny(page).catch(() => {});
+        return true;
+      case "black": {
+        this.log(`Tela preta/UI vazia — escada ${n}/${BLACK_RECOVER_MAX}`);
+        const step = (n - 1) % 7;
+        if (step === 0) await page.reload({ waitUntil: "load", timeout: 90_000 }).catch(() => {});
+        else if (step === 1)
+          await page.goto(`${FLOW}/agent/chat`, { waitUntil: "networkidle", timeout: 90_000 }).catch(() => {});
+        else if (step === 2) {
+          await page.goto(`${FLOW}/m/agent-init`, { waitUntil: "load", timeout: 90_000 }).catch(() => {});
+          await sleep(800);
+          await startAgentWizard(page);
+        } else if (step === 3) {
+          await page.evaluate(() => window.location.reload()).catch(() => {});
+          await sleep(2500);
+        } else if (step === 4) {
+          await dismissPromoOverlay(page);
+          await page.goto(`${FLOW}/agent/chat`, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
+        } else if (step === 5) await escapeStuckInit(page);
+        else if (agent) await ensureAgentOnChat(page, agent);
+        else await startAgentWizard(page);
+        await dismissPromoOverlay(page);
+        return true;
+      }
+      case "welcome":
+        this.log("Welcome — wizard BYOA");
+        if (agent) await ensureAgentOnChat(page, agent);
+        else await startAgentWizard(page);
+        return true;
+      case "stuck-init":
+        this.log("Initializing preso — escape");
+        await escapeStuckInit(page);
+        return true;
+      case "byoa-modal":
+        await resolveAddAgentModal(page);
+        return true;
+      case "wizard":
+        await resolveAddAgentModal(page);
+        await ensureWizardReady(page).catch(() => {});
+        return true;
+      case "chat-empty":
+        this.log("Chat vazio — reabrir");
+        await page.goto(`${FLOW}/agent/chat`, { waitUntil: "load", timeout: 90_000 }).catch(() => {});
+        await clickGeneralChat(page).catch(() => {});
+        return true;
+      case "reload":
+        await page.reload({ waitUntil: "load", timeout: 90_000 }).catch(() => {});
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  async ensureHealthy(agent, label = "page", maxRounds = BLACK_RECOVER_MAX) {
+    for (let i = 0; i < maxRounds; i++) {
+      const state = await this.scan();
+      if (state.healthy || (await hasActiveChat(this.page))) return state;
+      const action = this.pickAction(state);
+      if (action === "ok") return state;
+      if (action === "browser-dead") throw new Error("Browser fechado durante recuperação.");
+      if (this.counts.black > 5 && action === "black") {
+        this.log(`${label}: rota alternativa /agent-init`);
+        await this.page.goto(`${FLOW}/m/agent-init`, { waitUntil: "load", timeout: 90_000 }).catch(() => {});
+        if (agent) await ensureAgentOnChat(this.page, agent);
+      }
+      await this.execute(action, agent);
+      await sleep(BLACK_SCREEN_POLL_MS);
+    }
+    throw new Error(`${label}: não recuperou (${maxRounds}x) — tela preta/UI vazia.`);
+  }
+
+  async waitUntil(checkFn, { timeoutMs = 90_000, agent, label = "wait" } = {}) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (await checkFn()) return true;
+      const state = await this.scan();
+      if (state.blackScreen || state.initTitle || (state.textLen < 100 && !state.healthy)) {
+        const action = this.pickAction(state);
+        if (action !== "ok") await this.execute(action, agent);
+      }
+      await sleep(BLACK_SCREEN_POLL_MS);
+    }
+    throw new Error(`Timeout ${label} (${timeoutMs}ms)`);
+  }
+}
+
+function flowBrain(page, slot) {
+  return new FlowBrain(page, slot);
 }
 
 function genPassword() {
@@ -353,6 +552,10 @@ async function smartGoto(page, url, timeout = 60_000) {
     try {
       await page.goto(url, { waitUntil: NAV_WAIT, timeout });
       await dismissPromoOverlay(page);
+      const health = await probePageHealth(page);
+      if (health.blackScreen && url.includes("/agent/chat")) {
+        await flowBrain(page, 0).execute("black", AGENT);
+      }
       return;
     } catch (err) {
       if (attempt >= 4) throw err;
@@ -1180,15 +1383,18 @@ async function startAgentWizard(page) {
   await ensureWizardReady(page);
 }
 
-async function runAgentInit(page, agent = AGENT) {
+async function runAgentInit(page, agent = AGENT, slot = 0) {
+  const b = flowBrain(page, slot);
   await startAgentWizard(page);
+  await b.ensureHealthy(agent, "pré-wizard", 4);
 
   console.log("     Passo 1: Establish Identity");
   await fillAgentIdentity(page, agent);
   if (!(await clickContinueWhenReady(page, 45_000))) {
     throw new Error("Continue bloqueado no passo Identity.");
   }
-  await sleep(500);
+  await b.ensureHealthy(agent, "pós-identity", 4);
+  await sleep(400);
 
   console.log("     Passo 2: Shape Personality →", agent.persona);
   await page.getByText(/Shape Personality|Core Archetype/i).first().waitFor({ state: "visible", timeout: 30_000 });
@@ -1197,30 +1403,39 @@ async function runAgentInit(page, agent = AGENT) {
   if (!(await clickContinueWhenReady(page, 45_000))) {
     throw new Error("Continue bloqueado no passo Personality.");
   }
-  await sleep(500);
+  await b.ensureHealthy(agent, "pós-persona", 4);
+  await sleep(400);
 
   console.log("     Passo 3: Set Boundaries → Generate Soul");
   if (!(await clickGenerateSoulWhenReady(page, 45_000))) {
     throw new Error("Generate Soul não ficou disponível.");
   }
-  await sleep(1000);
+  await sleep(800);
 
-  console.log("     Aguardar chat…");
-  await waitPastInitializing(page, 60_000);
+  console.log("     Aguardar chat (FlowBrain activo)…");
+  await b.waitUntil(
+    async () => {
+      const h = await probePageHealth(page);
+      return h.healthy || (await hasActiveChat(page));
+    },
+    { timeoutMs: 90_000, agent, label: "pós-Generate Soul" }
+  );
+
   await page.waitForURL(/\/agent\/chat/, { timeout: 30_000 }).catch(async () => {
     await page.goto(`${FLOW}/agent/chat`, { waitUntil: "load", timeout: 90_000 });
   });
-  await sleep(1000);
   await escapeStuckInit(page);
   await ensureAgentOnChat(page, agent);
-  await ensureChatLoaded(page, "pós-Generate Soul");
+  await b.ensureHealthy(agent, "chat-final", BLACK_RECOVER_MAX);
   await openGeneralChat(page);
-  await waitForComposer(page, 60_000);
+  await waitForComposer(page, 90_000, slot, agent);
 }
 
 async function isChatBlank(page) {
   if (await isStuckInitializing(page)) return true;
   if (await isWelcomeNoAgent(page)) return true;
+  const h = await probePageHealth(page);
+  if (h.blackScreen || h.initTitle) return true;
   return page.evaluate(() => {
     const text = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
     const hasGeneral = [...document.querySelectorAll("button")].some((b) =>
@@ -1235,39 +1450,9 @@ async function isChatBlank(page) {
   });
 }
 
-async function ensureChatLoaded(page, label = "chat") {
-  for (let attempt = 1; attempt <= 10; attempt++) {
-    await dismissPromoOverlay(page);
-    await escapeStuckInit(page);
-
-    if (await isWelcomeNoAgent(page)) {
-      console.log(`     Welcome sem agente — recuperar ${label} (${attempt}/10)…`);
-      await startAgentWizard(page);
-      await sleep(1500);
-      continue;
-    }
-
-    if (await hasActiveChat(page)) return true;
-
-    if (!(await isChatBlank(page))) {
-      const ok =
-        (await page.getByRole("button", { name: /General chat/i }).first().isVisible().catch(() => false)) &&
-        (await composerReady(page));
-      if (ok) return true;
-    }
-
-    console.log(`     Tela preta/init — recuperar ${label} (${attempt}/10)…`);
-    await page.goto(`${FLOW}/agent/chat`, { waitUntil: "load", timeout: 90_000 }).catch(() => {});
-    if (attempt % 2 === 0) {
-      await page.reload({ waitUntil: "load", timeout: 90_000 }).catch(() => {});
-    }
-    await page.waitForLoadState("networkidle", { timeout: 25_000 }).catch(() => {});
-    await sleep(1500 + attempt * 300);
-    await ensureWafCleared(page);
-    await clickGeneralChat(page).catch(() => {});
-  }
-
-  throw new Error("Chat ficou em tela preta após inicializar agente.");
+async function ensureChatLoaded(page, label = "chat", slot = 0, agent = AGENT) {
+  await flowBrain(page, slot).ensureHealthy(agent, label, BLACK_RECOVER_MAX);
+  return true;
 }
 
 async function getComposerLocator(page) {
@@ -1288,17 +1473,10 @@ async function composerReady(page) {
   });
 }
 
-async function waitForComposer(page, timeoutMs = 90_000) {
-  await page.waitForFunction(
-    () => {
-      const el = document.querySelector(
-        '[contenteditable="true"].tiptap, [contenteditable="true"][data-placeholder*="Tell"]'
-      );
-      if (!el) return false;
-      const r = el.getBoundingClientRect();
-      return r.width > 80 && r.height > 15;
-    },
-    { timeout: timeoutMs }
+async function waitForComposer(page, timeoutMs = 90_000, slot = 0, agent = AGENT) {
+  await flowBrain(page, slot).waitUntil(
+    async () => (await composerReady(page)) && (await hasActiveChat(page)),
+    { timeoutMs, agent, label: "composer" }
   );
 }
 
@@ -1463,7 +1641,11 @@ async function waitForProspilotResponse(page, slot) {
 
     let s;
     try {
-      if (polls === 1 || polls % 5 === 0) {
+      if (polls === 1 || polls % 4 === 0) {
+        const h = await probePageHealth(page);
+        if (h.blackScreen || h.initTitle) {
+          await flowBrain(page, slot).execute("black", AGENT);
+        }
         await openGeneralChat(page).catch(() => {});
       }
       s = await readChatState(page);
@@ -1860,7 +2042,7 @@ async function runOnboard({ page, context, slot = 1, agent = AGENT, mailbox: pre
     await saveSession(context, creds, slot);
 
     slotLog(slot, "5/5 Criar agente + @prospilot");
-    await runWithRecovery(page, slot, "agent-wizard", () => runAgentInit(page, agent), 5);
+    await runWithRecovery(page, slot, "agent-wizard", () => runAgentInit(page, agent, slot), 5);
     slotLog(slot, `URL: ${page.url()}`);
     await runWithRecovery(page, slot, "prospilot", () => callProspilot(page, slot), 4);
     await saveSession(context, null, slot);
