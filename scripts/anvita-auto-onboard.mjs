@@ -58,7 +58,7 @@ const PROSPILOT_ACK_MS = Number(process.env.ANVITA_PROSPILOT_ACK_MS || 45_000);
 const PROSPILOT_SILENT_MS = Number(process.env.ANVITA_PROSPILOT_SILENT_MS || 35_000);
 const PROSPILOT_CMD_TEXT = `@prospilot ${process.env.ANVITA_PROSPILOT_CMD || "What is Faroo?"}`;
 
-/** Guard IA activo? VPS desliga por defeito (ANVITA_GUARD=0 no run-anvita-vps.mjs). */
+/** Guard IA activo? VPS activo por defeito (ANVITA_GUARD=1 no run-anvita-vps.mjs). Desliga: ANVITA_GUARD=0 */
 function guardEnabled() {
   if (process.env.ANVITA_GUARD === "1") return true;
   if (process.env.ANVITA_GUARD === "0") return false;
