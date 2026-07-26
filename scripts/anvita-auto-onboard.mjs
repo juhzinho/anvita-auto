@@ -1509,7 +1509,7 @@ async function ensureWafCleared(page) {
   return !(await wafBlocking(page));
 }
 
-async function dragSliderInContext(ctx, pageRef) {
+async function dragSliderInContext(ctx, pageRef, distancePx = null) {
   const page = pageRef || ("mouse" in ctx ? ctx : ctx.page());
   const mouse = page.mouse;
   const sliderSelectors = [
@@ -1530,33 +1530,86 @@ async function dragSliderInContext(ctx, pageRef) {
   ];
 
   let slider = null;
+  let sliderSel = "";
   for (const sel of sliderSelectors) {
     const loc = ctx.locator(sel).first();
     if (await loc.count()) {
       slider = loc;
+      sliderSel = sel;
       break;
     }
   }
   if (!slider) return false;
 
   let track = null;
+  let trackSel = "";
   for (const sel of trackSelectors) {
     const loc = ctx.locator(sel).first();
     if (await loc.count()) {
       track = loc;
+      trackSel = sel;
       break;
     }
   }
 
+  // 1) Playwright dragTo (melhor em headless)
+  if (track) {
+    try {
+      const trackBox = await track.boundingBox();
+      if (trackBox) {
+        await slider.dragTo(track, {
+          targetPosition: { x: Math.max(10, trackBox.width - 15), y: Math.max(5, trackBox.height / 2) },
+          force: true,
+          timeout: 15_000,
+        });
+        await sleep(800);
+        return true;
+      }
+    } catch {
+      /* fallback mouse */
+    }
+  }
+
   const sliderBox = await slider.boundingBox();
-  if (!sliderBox) return false;
+  if (!sliderBox) {
+    // 2) DOM events quando boundingBox falha (headless)
+    const evalTarget = typeof ctx.evaluate === "function" ? ctx : page;
+    const dragged = await evalTarget
+      .evaluate(
+        ({ sliderSel, trackSel, dist }) => {
+          const sliderEl = document.querySelector(sliderSel);
+          const trackEl = document.querySelector(trackSel);
+          if (!sliderEl) return false;
+          const trackW = trackEl?.getBoundingClientRect().width || dist || 280;
+          const s = sliderEl.getBoundingClientRect();
+          const startX = s.left + s.width / 2;
+          const y = s.top + s.height / 2;
+          const endX = startX + trackW - s.width * 0.5;
+          const fire = (type, x) =>
+            sliderEl.dispatchEvent(
+              new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y, view: window })
+            );
+          fire("mousedown", startX);
+          for (let i = 1; i <= 25; i++) {
+            const t = i / 25;
+            fire("mousemove", startX + (endX - startX) * t);
+          }
+          fire("mouseup", endX);
+          return true;
+        },
+        { sliderSel, trackSel, dist: distancePx || 280 }
+      )
+      .catch(() => false);
+    return dragged;
+  }
 
   let endX;
+  const dragDist = distancePx || 280;
   if (track) {
     const trackBox = await track.boundingBox();
-    endX = trackBox ? trackBox.x + trackBox.width - sliderBox.width * 0.6 : sliderBox.x + 280;
+    endX = trackBox ? trackBox.x + trackBox.width - sliderBox.width * 0.55 : sliderBox.x + dragDist;
   } else {
-    endX = sliderBox.x + 280;
+    endX = sliderBox.x + dragDist;
   }
 
   const startX = sliderBox.x + sliderBox.width / 2;
@@ -1564,16 +1617,35 @@ async function dragSliderInContext(ctx, pageRef) {
 
   await mouse.move(startX, y);
   await mouse.down();
-  const steps = 30;
+  const steps = 40;
   for (let i = 1; i <= steps; i++) {
     const t = i / steps;
     const ease = t * t * (3 - 2 * t);
     const x = startX + (endX - startX) * ease + (Math.random() - 0.5) * 2;
     await mouse.move(x, y + (Math.random() - 0.5) * 1.5);
-    await sleep(12 + Math.random() * 18);
+    await sleep(10 + Math.random() * 20);
   }
   await mouse.up();
   return true;
+}
+
+async function tryDragCaptcha(page) {
+  const distances = process.env.ANVITA_VPS === "1" ? [260, 280, 300, 240, 320] : [280, 260, 300];
+  for (const dist of distances) {
+    let dragged = await dragSliderInContext(page, page, dist);
+    if (!dragged) {
+      for (const frame of page.frames()) {
+        if (frame === page.mainFrame()) continue;
+        dragged = await dragSliderInContext(frame, page, dist);
+        if (dragged) break;
+      }
+    }
+    if (dragged) {
+      await sleep(1500);
+      if (!(await captchaVisible(page))) return true;
+    }
+  }
+  return false;
 }
 
 async function solveSlideCaptcha(page) {
@@ -1584,29 +1656,31 @@ async function solveSlideCaptcha(page) {
     return ensureWafCleared(page);
   }
 
-  for (let attempt = 0; attempt < 4; attempt++) {
-    if (!(await captchaVisible(page))) return true;
-
-    let dragged = await dragSliderInContext(page, page);
-    if (!dragged) {
-      for (const frame of page.frames()) {
-        if (frame === page.mainFrame()) continue;
-        dragged = await dragSliderInContext(frame, page);
-        if (dragged) break;
-      }
-    }
-
-    await sleep(1500);
-
+  const maxAttempts = process.env.ANVITA_VPS === "1" ? 12 : 4;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (!(await captchaVisible(page))) {
       console.log("     Captcha OK.");
       return true;
     }
 
-    await sleep(800);
+    if (await tryDragCaptcha(page)) {
+      console.log("     Captcha OK.");
+      return true;
+    }
+
+    await sleep(600 + attempt * 200);
   }
 
-  // último recurso: espera manual breve
+  if (process.env.ANVITA_VPS === "1") {
+    console.log("     ⚠ Captcha VPS — retry auto (sem espera manual)…");
+    for (let attempt = 0; attempt < 6; attempt++) {
+      if (!(await captchaVisible(page))) return true;
+      if (await tryDragCaptcha(page)) return true;
+      await sleep(1000);
+    }
+    return !(await captchaVisible(page));
+  }
+
   console.log("     ⚠ Slider auto falhou — tenta deslizar manualmente (60s)…");
   await page
     .waitForFunction(
@@ -1628,6 +1702,11 @@ async function solveCaptchaIfAny(page) {
   await waitCaptchaGone(page, 3000);
   if (await captchaVisible(page)) {
     const ok = await solveSlideCaptcha(page);
+    if (!ok && process.env.ANVITA_VPS === "1") {
+      // VPS headless: não bloquear — retry no próximo passo
+      console.warn("     ⚠ Captcha pendente VPS — continuar e retry…");
+      return false;
+    }
     if (!ok) throw new Error("Captcha não resolvido.");
   }
   await waitCaptchaGone(page, 10_000);
