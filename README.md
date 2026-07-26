@@ -20,5 +20,8 @@ npm run anvita:vps
 | `ANVITA_HEADED` | `0` no VPS | `1` para browser visível |
 | `ANVITA_POOL_TOTAL` | `500` no VPS | Meta de contas |
 | `ANVITA_POOL_WORKERS` | `2` no VPS | Workers paralelos |
+| `ANVITA_POOL_RETRIES` | `8` | Tentativas por conta no pool |
+| `ANVITA_BROWSER_RESTART_EVERY` | `12` | Reinicia browser a cada N contas |
+| `ANVITA_STUCK_MS` | `90000` | Reenvia @prospilot se parado 90s |
 
 Credenciais em `.anvita-auto/` (local, não commitar).

@@ -8,7 +8,8 @@
  * Browser: ANVITA_BROWSER=brave|chromium|chrome|edge|firefox|webkit
  * VPS Windows: npm run anvita:vps  (Edge headless por default)
  * VPS Linux:   npm run anvita:vps  (Chromium headless por default)
- * Se captcha bloquear send-otp, corre com ANVITA_HEADED=1 para ver o browser.
+ * Robustez: auto-recuperação por fase, browser reutilizado no pool, screenshots em falhas.
+ * ANVITA_POOL_RETRIES=8 ANVITA_BROWSER_RESTART_EVERY=12 ANVITA_STUCK_MS=90000
  */
 
 import { randomBytes } from "node:crypto";
@@ -17,6 +18,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const AUTO_DIR = path.join(__dirname, "..", ".anvita-auto");
 const FLOW = process.env.ANVITA_FLOW_URL?.replace(/\/$/, "") || "https://flow.anvita.xyz";
 const HEADED =
   process.env.ANVITA_VPS === "1"
@@ -37,9 +39,155 @@ const DONE_SETTLE_MS = Number(process.env.ANVITA_DONE_SETTLE_MS || 2_000);
 const IS_POOL = process.env.ANVITA_POOL === "1";
 const NAV_WAIT = "domcontentloaded";
 const POLL_MS = 1_500;
+const OTP_TIMEOUT_MS = Number(process.env.ANVITA_OTP_TIMEOUT_MS || (process.env.ANVITA_VPS === "1" ? 180_000 : 120_000));
+const POOL_MAX_ROUNDS = Math.max(3, Number(process.env.ANVITA_POOL_RETRIES || 8));
+const BROWSER_RESTART_EVERY = Math.max(5, Number(process.env.ANVITA_BROWSER_RESTART_EVERY || 12));
+const STUCK_PHASE_MS = Number(process.env.ANVITA_STUCK_MS || 90_000);
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+async function fetchWithRetry(url, options = {}, retries = 5) {
+  let lastErr;
+  for (let i = 1; i <= retries; i++) {
+    try {
+      const res = await fetch(url, options);
+      if (res.status === 429 && i < retries) {
+        await sleep(4000 * i);
+        continue;
+      }
+      return res;
+    } catch (err) {
+      lastErr = err;
+      if (i >= retries) break;
+      await sleep(2000 * i);
+    }
+  }
+  throw lastErr || new Error(`fetch failed: ${url}`);
+}
+
+async function analyzePageSituation(page) {
+  if (page.isClosed()) return { phase: "closed", closed: true };
+  const url = page.url();
+  const state = await page
+    .evaluate(() => {
+      const text = document.body?.innerText || "";
+      return {
+        hasRegister: !!document.querySelector('#email, input[name="email"], input[type="email"]'),
+        hasOtp: !!document.querySelector('#otp, input[name="otp"], input[placeholder*="OTP"]'),
+        hasProfile: /Set up your profile/i.test(text),
+        hasWizard: /Establish Identity|Shape Personality|Generate Soul|Agent Name/i.test(text),
+        hasChat: /General chat|Tell your agent|File List/i.test(text),
+        hasInitializing: /Initializing|Shaping the soul of your Anvita/i.test(text),
+        hasAddAgentModal: /Add Agent|Bring Your Own Agent|Connect your existing agent/i.test(text),
+        emailRegistered: /already registered|email is already/i.test(text),
+        hasWaf: (() => {
+          const b = document.querySelector("#waf_nc_block");
+          return b && /Access Verification|slide to verify/i.test(b.innerText || "");
+        })(),
+        hasCaptcha: !!document.getElementById("aliyunCaptcha-mask")?.classList.contains("mask-show"),
+        prospilotDone: /from ProsPilot|Matched ProsPilot/i.test(text),
+        delegationFailed: /command execution tools are unavailable|cannot complete the delegation/i.test(text),
+      };
+    })
+    .catch(() => ({}));
+
+  let phase = "unknown";
+  if (state.hasInitializing) phase = "stuck-init";
+  else if (url.includes("/register")) {
+    if (state.hasProfile) phase = "register-profile";
+    else if (state.hasOtp) phase = "register-otp";
+    else phase = "register-email";
+  } else if (state.hasWizard || url.includes("/agent-init")) phase = "agent-wizard";
+  else if (url.includes("/agent/chat") || state.hasChat) phase = "chat";
+  else if (url.includes("/authorize")) phase = "authorize";
+
+  return { url, phase, ...state };
+}
+
+async function saveFailureScreenshot(page, slot, label) {
+  if (page.isClosed()) return;
+  const dir = path.join(AUTO_DIR, "failures");
+  mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `slot${slot}-${label}-${Date.now()}.png`);
+  await page.screenshot({ path: file, fullPage: true }).catch(() => {});
+  slotLog(slot, `📸 Screenshot: ${file}`);
+}
+
+async function smartRecover(page, slot, situation, errMsg) {
+  const msg = String(errMsg || "");
+  slotLog(slot, `🔧 Recuperar (${situation?.phase || "?"}) — ${msg.slice(0, 100)}`);
+
+  if (situation?.closed || /closed|crashed|Target page|context.*destroyed/i.test(msg)) {
+    return false;
+  }
+
+  if (situation?.hasWaf || situation?.hasCaptcha || /captcha|WAF/i.test(msg)) {
+    await ensureWafCleared(page);
+    await solveCaptchaIfAny(page).catch(() => {});
+    return true;
+  }
+
+  if (situation?.phase === "stuck-init" || situation?.hasInitializing) {
+    await escapeStuckInit(page);
+    return true;
+  }
+
+  if (situation?.hasAddAgentModal) {
+    await resolveAddAgentModal(page);
+    return true;
+  }
+
+  if (situation?.phase === "chat" || page.url().includes("/agent/chat")) {
+    await ensureChatLoaded(page, "smart-recover");
+    await openGeneralChat(page).catch(() => {});
+    return true;
+  }
+
+  if (situation?.phase === "agent-wizard") {
+    await resolveAddAgentModal(page);
+    await ensureWizardReady(page).catch(() => {});
+    return true;
+  }
+
+  if (situation?.phase === "register-email" || situation?.phase === "register-otp") {
+    await openRegisterPage(page).catch(() => {});
+    return true;
+  }
+
+  if (/timeout|net::|ERR_|navigation|ECONNRESET|ETIMEDOUT/i.test(msg)) {
+    await page.reload({ waitUntil: "load", timeout: 90_000 }).catch(async () => {
+      await smartGoto(page, `${FLOW}/register`, 90_000).catch(() => {});
+    });
+    return true;
+  }
+
+  return false;
+}
+
+async function runWithRecovery(page, slot, label, fn, maxAttempts = 4) {
+  let lastErr;
+  for (let i = 1; i <= maxAttempts; i++) {
+    try {
+      assertPageOpen(page);
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (err instanceof EmailAlreadyRegisteredError) throw err;
+      const msg = String(err.message || err);
+      if (i >= maxAttempts) break;
+      const situation = await analyzePageSituation(page).catch(() => ({ phase: "unknown" }));
+      const recovered = await smartRecover(page, slot, situation, msg);
+      if (!recovered) {
+        await saveFailureScreenshot(page, slot, `${label}-r${i}`);
+        if (/closed|crashed|Target page|destroyed/i.test(msg)) break;
+      }
+      slotLog(slot, `     Retry ${label} (${i}/${maxAttempts})…`);
+      await sleep(1200 * i);
+    }
+  }
+  throw lastErr;
 }
 
 function genPassword() {
@@ -51,7 +199,6 @@ function genUsername(email) {
   return `${base}${Math.floor(Math.random() * 900 + 100)}`.slice(0, 30);
 }
 
-const AUTO_DIR = path.join(__dirname, "..", ".anvita-auto");
 const USED_EMAILS_FILE = path.join(AUTO_DIR, "used-emails.json");
 
 function loadUsedEmails() {
@@ -116,7 +263,7 @@ async function reserveFreshMailbox(tag) {
 }
 
 async function mailTmCreate() {
-  const domainsRes = await fetch("https://api.mail.tm/domains");
+  const domainsRes = await fetchWithRetry("https://api.mail.tm/domains");
   if (!domainsRes.ok) throw new Error(`mail.tm domains HTTP ${domainsRes.status}`);
   const domainsJson = await domainsRes.json();
   const domain = domainsJson["hydra:member"]?.[0]?.domain;
@@ -126,7 +273,7 @@ async function mailTmCreate() {
   const email = `${login}@${domain}`;
   const mailPassword = genPassword();
 
-  const accRes = await fetch("https://api.mail.tm/accounts", {
+  const accRes = await fetchWithRetry("https://api.mail.tm/accounts", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ address: email, password: mailPassword }),
@@ -136,7 +283,7 @@ async function mailTmCreate() {
     throw new Error(`mail.tm create account HTTP ${accRes.status}: ${err.slice(0, 120)}`);
   }
 
-  const tokenRes = await fetch("https://api.mail.tm/token", {
+  const tokenRes = await fetchWithRetry("https://api.mail.tm/token", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ address: email, password: mailPassword }),
@@ -161,21 +308,21 @@ async function mailTmCreateWithRetry(slot) {
   }
 }
 
-async function mailTmWaitOtp(token, timeoutMs = 120_000) {
+async function mailTmWaitOtp(token, timeoutMs = OTP_TIMEOUT_MS) {
   const started = Date.now();
   await sleep(2_000);
   while (Date.now() - started < timeoutMs) {
-    const res = await fetch("https://api.mail.tm/messages", {
+    const res = await fetchWithRetry("https://api.mail.tm/messages", {
       headers: { Authorization: `Bearer ${token}` },
-    });
-    if (res.ok) {
+    }, 3).catch(() => null);
+    if (res?.ok) {
       const json = await res.json();
       const msgs = json["hydra:member"] ?? [];
       for (const m of msgs) {
-        const detailRes = await fetch(`https://api.mail.tm/messages/${m.id}`, {
+        const detailRes = await fetchWithRetry(`https://api.mail.tm/messages/${m.id}`, {
           headers: { Authorization: `Bearer ${token}` },
-        });
-        if (!detailRes.ok) continue;
+        }, 3).catch(() => null);
+        if (!detailRes?.ok) continue;
         const detail = await detailRes.json();
         const text = `${detail.subject || ""}\n${detail.text || ""}\n${detail.html || ""}`;
         const hit = text.match(/\b(\d{6})\b/);
@@ -184,7 +331,7 @@ async function mailTmWaitOtp(token, timeoutMs = 120_000) {
     }
     await sleep(POLL_MS);
   }
-  throw new Error("OTP não chegou ao email descartável (timeout 2min).");
+  throw new Error(`OTP não chegou ao email descartável (timeout ${Math.round(timeoutMs / 1000)}s).`);
 }
 
 function assertPageOpen(page) {
@@ -195,8 +342,17 @@ function assertPageOpen(page) {
 
 async function smartGoto(page, url, timeout = 60_000) {
   assertPageOpen(page);
-  await page.goto(url, { waitUntil: NAV_WAIT, timeout });
-  await dismissPromoOverlay(page);
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      await page.goto(url, { waitUntil: NAV_WAIT, timeout });
+      await dismissPromoOverlay(page);
+      return;
+    } catch (err) {
+      if (attempt >= 4) throw err;
+      await sleep(1500 * attempt);
+      if (page.isClosed()) throw err;
+    }
+  }
 }
 
 async function loadPlaywright() {
@@ -444,9 +600,10 @@ async function captchaVisible(page) {
 }
 
 async function ensureWafCleared(page) {
-  for (let attempt = 0; attempt < 8; attempt++) {
+  const maxAttempts = process.env.ANVITA_VPS === "1" ? 12 : 8;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (!(await wafBlocking(page))) return true;
-    console.log(`     WAF captcha — slider (${attempt + 1}/8)…`);
+    console.log(`     WAF captcha — slider (${attempt + 1}/${maxAttempts})…`);
     await dragSliderInContext(page, page);
     await sleep(2500);
   }
@@ -1174,6 +1331,8 @@ async function waitForProspilotResponse(page, slot) {
   let lastLog = "";
   let polls = 0;
   let resends = 0;
+  let lastPhaseChange = Date.now();
+  let lastPhase = "";
   const MAX_RESEND = Number(process.env.ANVITA_PROSPILOT_RESEND || 6);
 
   while (Date.now() < deadline) {
@@ -1189,6 +1348,11 @@ async function waitForProspilotResponse(page, slot) {
     } catch (err) {
       if (/closed|destroyed/i.test(String(err.message || err))) {
         throw new Error("Browser fechado — não feches a janela enquanto o agente chama o ProsPilot.");
+      }
+      const situation = await analyzePageSituation(page).catch(() => ({}));
+      if (await smartRecover(page, slot, situation, String(err.message || err))) {
+        await sleep(2000);
+        continue;
       }
       throw err;
     }
@@ -1208,6 +1372,7 @@ async function waitForProspilotResponse(page, slot) {
       await sleep(2_500);
       await sendProspilotMessage(page, slot);
       lastLog = "";
+      lastPhaseChange = Date.now();
       polls = 0;
       continue;
     }
@@ -1215,9 +1380,28 @@ async function waitForProspilotResponse(page, slot) {
     let phase = "a processar…";
     if (s.callToolExec || s.deepThinking) phase = "Deep thinking / Call tool exec…";
     if (s.callingExec) phase = "Calling exec (A2A em curso)…";
+    if (phase !== lastPhase) {
+      lastPhase = phase;
+      lastPhaseChange = Date.now();
+    }
     if (phase !== lastLog) {
       console.log(`${tag}… ${phase}`);
       lastLog = phase;
+    }
+
+    if (
+      Date.now() - lastPhaseChange > STUCK_PHASE_MS &&
+      !s.prospilotDone &&
+      resends < MAX_RESEND
+    ) {
+      resends += 1;
+      console.log(`${tag}⚠ Sem progresso ${Math.round(STUCK_PHASE_MS / 1000)}s — recuperar chat + reenviar (${resends}/${MAX_RESEND})…`);
+      await ensureChatLoaded(page, "prospilot-stuck").catch(() => {});
+      await openGeneralChat(page).catch(() => {});
+      await sendProspilotMessage(page, slot);
+      lastPhaseChange = Date.now();
+      lastLog = "";
+      continue;
     }
 
     if (s.prospilotDone && !s.callingExec) {
@@ -1408,8 +1592,7 @@ async function openRegisterPage(page) {
     });
 }
 
-async function launchBrowser(slot = 1) {
-  const browser = await launchPlaywrightBrowser({ args: browserWindowArgs() });
+async function createBrowserSession(browser, slot = 1) {
   const ctxOpts = {
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -1418,7 +1601,7 @@ async function launchBrowser(slot = 1) {
   };
   const stateForSlot =
     process.env.ANVITA_AGENT_ONLY === "1"
-      ? path.join(__dirname, "..", ".anvita-auto", `storage-state-${slot}.json`)
+      ? path.join(AUTO_DIR, `storage-state-${slot}.json`)
       : STATE_FILE;
   if (process.env.ANVITA_AGENT_ONLY === "1" && existsSync(stateForSlot)) {
     ctxOpts.storageState = stateForSlot;
@@ -1426,7 +1609,52 @@ async function launchBrowser(slot = 1) {
   const context = await browser.newContext(ctxOpts);
   const page = await context.newPage();
   await openRegisterPage(page);
-  return { browser, context, page };
+  return { context, page };
+}
+
+class WorkerBrowser {
+  constructor(workerId) {
+    this.workerId = workerId;
+    this.browser = null;
+    this.accountsSinceRestart = 0;
+  }
+
+  async ensureBrowser() {
+    if (this.browser?.isConnected?.()) return this.browser;
+    if (this.browser) await this.browser.close().catch(() => {});
+    this.browser = await launchPlaywrightBrowser({ args: browserWindowArgs() });
+    this.accountsSinceRestart = 0;
+    console.log(`[W${this.workerId}] Browser (re)iniciado`);
+    return this.browser;
+  }
+
+  async restart() {
+    if (this.browser) await this.browser.close().catch(() => {});
+    this.browser = null;
+    this.accountsSinceRestart = 0;
+    return this.ensureBrowser();
+  }
+
+  async newSession(slot) {
+    if (this.accountsSinceRestart >= BROWSER_RESTART_EVERY) {
+      await this.restart();
+    }
+    const browser = await this.ensureBrowser();
+    const session = await createBrowserSession(browser, slot);
+    this.accountsSinceRestart += 1;
+    return session;
+  }
+
+  async close() {
+    if (this.browser) await this.browser.close().catch(() => {});
+    this.browser = null;
+  }
+}
+
+async function launchBrowser(slot = 1) {
+  const browser = await launchPlaywrightBrowser({ args: browserWindowArgs() });
+  const session = await createBrowserSession(browser, slot);
+  return { browser, ...session };
 }
 
 async function saveSession(context, creds, slot = 1) {
@@ -1470,7 +1698,7 @@ async function runOnboard({ page, context, slot = 1, agent = AGENT, mailbox: pre
     }
 
     try {
-      await sendOtpReliable(page, slot, mailbox.email);
+      await runWithRecovery(page, slot, "send-otp", () => sendOtpReliable(page, slot, mailbox.email));
     } catch (err) {
       if (err instanceof EmailAlreadyRegisteredError || /EMAIL_ALREADY_REGISTERED/i.test(String(err.message))) {
         if (mailTry >= 5) throw new Error("Sem emails novos — todos já registados.");
@@ -1480,17 +1708,19 @@ async function runOnboard({ page, context, slot = 1, agent = AGENT, mailbox: pre
     }
 
     slotLog(slot, "3/5 Aguardar OTP…");
-    const otp = await mailTmWaitOtp(mailbox.token);
+    const otp = await runWithRecovery(page, slot, "wait-otp", () => mailTmWaitOtp(mailbox.token));
     slotLog(slot, `OTP: ${otp}`);
 
-    await setInput(page, '#otp, input[name="otp"], input[placeholder*="OTP"]', otp);
-    if (!(await clickContinueWhenReady(page, 45_000))) {
-      await clickText(page, "Continue");
-    }
-    await sleep(2000);
-    await solveCaptchaIfAny(page).catch(() => {});
+    await runWithRecovery(page, slot, "otp-submit", async () => {
+      await setInput(page, '#otp, input[name="otp"], input[placeholder*="OTP"]', otp);
+      if (!(await clickContinueWhenReady(page, 45_000))) {
+        await clickText(page, "Continue");
+      }
+      await sleep(2000);
+      await solveCaptchaIfAny(page).catch(() => {});
+    });
 
-    await completeProfileSetup(page, username, password);
+    await runWithRecovery(page, slot, "profile", () => completeProfileSetup(page, username, password));
     const creds = {
       email: mailbox.email,
       username,
@@ -1502,9 +1732,9 @@ async function runOnboard({ page, context, slot = 1, agent = AGENT, mailbox: pre
     await saveSession(context, creds, slot);
 
     slotLog(slot, "5/5 Criar agente + @prospilot");
-    await runAgentInit(page, agent);
+    await runWithRecovery(page, slot, "agent-wizard", () => runAgentInit(page, agent), 5);
     slotLog(slot, `URL: ${page.url()}`);
-    await callProspilot(page, slot);
+    await runWithRecovery(page, slot, "prospilot", () => callProspilot(page, slot), 4);
     await saveSession(context, null, slot);
 
     slotLog(slot, "✅ Concluído!");
@@ -1710,7 +1940,7 @@ async function poolMain(total = 100, workers = 2) {
     return null;
   }
 
-  async function runOneAccount(workerId) {
+  async function runOneAccount(workerId, workerBrowser) {
     const job = await acquireJob(workerId);
     if (!job) return false;
 
@@ -1718,7 +1948,6 @@ async function poolMain(total = 100, workers = 2) {
     const tag = `[W${workerId} · #${targetNum}]`;
     const log = (msg) => console.log(`${tag} ${msg}`);
 
-    let browser;
     let context;
     let page;
 
@@ -1726,7 +1955,7 @@ async function poolMain(total = 100, workers = 2) {
       log(`A obter email (tentativa ${attemptId})…`);
       let mailbox = await takeMailbox(workerId, targetNum);
 
-      ({ browser, context, page } = await launchBrowser(targetNum));
+      ({ context, page } = await workerBrowser.newSession(targetNum));
 
       const agent = {
         nome: `${AGENT.nome}${targetNum}`,
@@ -1736,15 +1965,20 @@ async function poolMain(total = 100, workers = 2) {
 
       let creds;
       let lastErr;
-      for (let round = 1; round <= 5; round++) {
+      for (let round = 1; round <= POOL_MAX_ROUNDS; round++) {
         try {
           if (round > 1) {
-            log(`Retry ${round}/5 — reservar email novo…`);
+            log(`Retry ${round}/${POOL_MAX_ROUNDS} — reservar email novo…`);
             mailbox = await takeMailbox(workerId, `${targetNum}r${round}`);
-            await openRegisterPage(page).catch(async () => {
-              await browser.close().catch(() => {});
-              ({ browser, context, page } = await launchBrowser(targetNum));
-            });
+            await context?.close().catch(() => {});
+            try {
+              ({ context, page } = await workerBrowser.newSession(targetNum));
+            } catch (launchErr) {
+              log(`     Browser crash — reiniciar worker…`);
+              await workerBrowser.restart();
+              ({ context, page } = await workerBrowser.newSession(targetNum));
+            }
+            await openRegisterPage(page).catch(() => smartGoto(page, `${FLOW}/register`));
           }
           creds = await runOnboard({ page, context, slot: targetNum, agent, mailbox });
           lastErr = null;
@@ -1755,7 +1989,23 @@ async function poolMain(total = 100, workers = 2) {
           if (/EMAIL_ALREADY_REGISTERED|already registered/i.test(String(err.message))) {
             continue;
           }
-          await sleep(1500);
+          if (/closed|crashed|Target page|destroyed|Browser fechado/i.test(String(err.message))) {
+            await context?.close().catch(() => {});
+            context = null;
+            page = null;
+            try {
+              await workerBrowser.restart();
+            } catch {
+              /* next round will retry */
+            }
+          } else {
+            const situation = page ? await analyzePageSituation(page).catch(() => ({})) : {};
+            if (page && (await smartRecover(page, targetNum, situation, String(err.message)))) {
+              continue;
+            }
+            if (page) await saveFailureScreenshot(page, targetNum, `round${round}`);
+          }
+          await sleep(1500 * Math.min(round, 4));
         }
       }
       if (lastErr) throw lastErr;
@@ -1780,6 +2030,7 @@ async function poolMain(total = 100, workers = 2) {
       return true;
     } catch (err) {
       log(`❌ Falhou: ${err.message || err}`);
+      if (page) await saveFailureScreenshot(page, targetNum, "final-fail").catch(() => {});
       await persist({
         ok: false,
         accountNum: targetNum,
@@ -1792,15 +2043,21 @@ async function poolMain(total = 100, workers = 2) {
     } finally {
       await withLock(() => inFlight.delete(targetNum));
       if (context) await saveSession(context, null, targetNum).catch(() => {});
-      if (browser) await browser.close().catch(() => {});
+      if (context) await context.close().catch(() => {});
     }
   }
 
-  async function workerLoop(workerId) {
+  async function workerLoop(workerId, workerBrowser) {
     await sleep((workerId - 1) * PARALLEL_STAGGER_MS);
     while (true) {
-      const again = await runOneAccount(workerId);
-      if (!again) break;
+      try {
+        const again = await runOneAccount(workerId, workerBrowser);
+        if (!again) break;
+      } catch (err) {
+        console.error(`[W${workerId}] Worker crash — recuperar:`, err.message || err);
+        await workerBrowser.restart().catch(() => {});
+        await sleep(5000);
+      }
       let done;
       await withLock(() => {
         done = successCount >= total;
@@ -1809,7 +2066,9 @@ async function poolMain(total = 100, workers = 2) {
     }
   }
 
-  await Promise.all(Array.from({ length: workers }, (_, i) => workerLoop(i + 1)));
+  const workerBrowsers = Array.from({ length: workers }, (_, i) => new WorkerBrowser(i + 1));
+  await Promise.all(workerBrowsers.map((wb, i) => workerLoop(i + 1, wb)));
+  for (const wb of workerBrowsers) await wb.close();
 
   const ok = results.filter((r) => r.ok).length;
   const fail = results.filter((r) => !r.ok).length;
