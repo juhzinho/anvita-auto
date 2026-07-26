@@ -155,7 +155,7 @@ async function smartRecover(page, slot, situation, errMsg) {
   }
 
   if (situation?.phase === "welcome-no-agent" || situation?.hasWelcomeNoAgent) {
-    await startAgentWizard(page);
+    await runFullByoaWizard(page, AGENT, slot);
     return true;
   }
 
@@ -330,7 +330,21 @@ class BlackScreenGuard {
     const url = this.page.url();
     if (!url.includes("anvita.xyz")) return;
 
-    const h = await probePageHealth(this.page).catch(() => ({ blackScreen: true, initTitle: true }));
+    const h = await probePageHealth(this.page).catch(() => ({}));
+    const welcome = await isWelcomeNoAgent(this.page).catch(() => false);
+
+    if (welcome || h.addAgentBtn) {
+      this.recovering = true;
+      try {
+        if (this.slot) slotLog(this.slot, "⚡ Guard IA: Welcome — criar agente BYOA");
+        else console.log("     ⚡ Guard IA: Welcome — criar agente BYOA");
+        await runFullByoaWizard(this.page, this.agent, this.slot);
+      } finally {
+        this.recovering = false;
+      }
+      return;
+    }
+
     if (!h.blackScreen && !h.initTitle) return;
 
     this.recovering = true;
@@ -438,16 +452,15 @@ class FlowBrain {
           await page.goto(`${FLOW}/agent/chat`, { waitUntil: "load", timeout: 90_000 }).catch(() => {});
           await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
         } else if (step === 6) await escapeStuckInit(page);
-        else if (agent) await ensureAgentOnChat(page, agent);
+        else if (agent) await runFullByoaWizard(page, agent, this.slot);
         else await startAgentWizard(page);
         await dismissPromoOverlay(page);
         await sleep(600);
         return true;
       }
       case "welcome":
-        this.log("Welcome — wizard BYOA");
-        if (agent) await ensureAgentOnChat(page, agent);
-        else await startAgentWizard(page);
+        this.log("Welcome — wizard BYOA completo");
+        await runFullByoaWizard(this.page, agent, this.slot);
         return true;
       case "stuck-init":
         this.log("Initializing preso — escape");
@@ -483,7 +496,7 @@ class FlowBrain {
       if (this.counts.black > 5 && action === "black") {
         this.log(`${label}: rota alternativa /agent-init`);
         await this.page.goto(`${FLOW}/m/agent-init`, { waitUntil: "load", timeout: 90_000 }).catch(() => {});
-        if (agent) await ensureAgentOnChat(this.page, agent);
+        if (agent) await runFullByoaWizard(this.page, agent, this.slot);
       }
       await this.execute(action, agent);
       await sleep(BLACK_SCREEN_POLL_MS);
@@ -1323,6 +1336,121 @@ async function resolveAddAgentModal(page) {
   return false;
 }
 
+async function clickAddAgentReliable(page) {
+  for (let i = 0; i < 6; i++) {
+    await dismissPromoOverlay(page);
+    const loc = page.getByRole("button", { name: /^Add Agent$/i }).first();
+    if (await loc.isVisible().catch(() => false)) {
+      await loc.click({ force: true, timeout: 15_000 }).catch(() => {});
+      await sleep(900);
+      if (await page.getByText(/Bring Your Own Agent|Establish Identity|Agent Name/i).first().isVisible().catch(() => false)) {
+        return true;
+      }
+    }
+    const clicked = await page
+      .evaluate(() => {
+        for (const el of document.querySelectorAll("button, a, [role=button]")) {
+          if (/^Add Agent$/i.test((el.textContent || "").trim())) {
+            el.click();
+            return true;
+          }
+        }
+        return false;
+      })
+      .catch(() => false);
+    if (clicked) {
+      await sleep(900);
+      return true;
+    }
+    await sleep(400);
+  }
+  return false;
+}
+
+/** Wizard BYOA completo — nunca avança sem General chat + composer. */
+async function runFullByoaWizard(page, agent = AGENT, slot = 0) {
+  const b = flowBrain(page, slot);
+
+  for (let round = 1; round <= 10; round++) {
+    if (await hasActiveChat(page)) {
+      slotLog(slot, "✅ Agente activo — General chat OK");
+      return true;
+    }
+
+    slotLog(slot, `🤖 BYOA completo — ronda ${round}/10`);
+
+    await b.ensureHealthy(agent, `byoa-pre-${round}`, 4).catch(() => {});
+    await clickAddAgentReliable(page);
+    await sleep(600);
+    await resolveAddAgentModal(page);
+    await sleep(800);
+
+    const onWizard = await page
+      .getByText(/Establish Identity|Agent Name|get to know each other/i)
+      .first()
+      .isVisible()
+      .catch(() => false);
+
+    if (!onWizard) {
+      await smartGoto(page, `${FLOW}/m/agent-init`, 60_000, slot, agent);
+      await clickAddAgentReliable(page).catch(() => {});
+      await resolveAddAgentModal(page);
+      await sleep(800);
+    }
+
+    if (await page.getByText(/Establish Identity|Agent Name/i).first().isVisible().catch(() => false)) {
+      slotLog(slot, "     Identity → Persona → Generate Soul");
+      await fillAgentIdentity(page, agent);
+      if (!(await clickContinueWhenReady(page, 45_000))) {
+        throw new Error("Continue bloqueado — Identity");
+      }
+      await sleep(400);
+      await page.getByText(/Shape Personality|Core Archetype/i).first().waitFor({ state: "visible", timeout: 30_000 }).catch(() => {});
+      await selectPersonaStep(page, agent);
+      await sleep(300);
+      if (!(await clickContinueWhenReady(page, 45_000))) {
+        throw new Error("Continue bloqueado — Personality");
+      }
+      await sleep(400);
+      if (!(await clickGenerateSoulWhenReady(page, 45_000))) {
+        throw new Error("Generate Soul indisponível");
+      }
+      await sleep(1200);
+    }
+
+    await b.waitUntil(async () => hasActiveChat(page), {
+      timeoutMs: 75_000,
+      agent,
+      label: "pós-Generate Soul",
+    }).catch(() => {});
+
+    if (await hasActiveChat(page)) return true;
+
+    await page.goto(`${FLOW}/agent/chat`, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
+    await sleep(1000);
+  }
+
+  throw new Error("BYOA falhou — Welcome/sem agente após 10 rondas.");
+}
+
+async function requireActiveAgent(page, slot, agent = AGENT) {
+  if (await hasActiveChat(page)) return true;
+  if (await isWelcomeNoAgent(page)) {
+    slotLog(slot, "🚨 Welcome detectado — agente obrigatório");
+    await runFullByoaWizard(page, agent, slot);
+  } else {
+    const addVisible = await page.getByRole("button", { name: /^Add Agent$/i }).first().isVisible().catch(() => false);
+    if (addVisible) await runFullByoaWizard(page, agent, slot);
+  }
+  if (!(await hasActiveChat(page))) {
+    await runFullByoaWizard(page, agent, slot);
+  }
+  if (!(await hasActiveChat(page))) {
+    throw new Error("Bloqueado: chat inactivo — agente não criado.");
+  }
+  return true;
+}
+
 async function isWelcomeNoAgent(page) {
   return page.evaluate(() => {
     const text = document.body?.innerText || "";
@@ -1356,48 +1484,8 @@ async function hasActiveChat(page) {
   return generalVisible && (await composerReady(page));
 }
 
-async function ensureAgentOnChat(page, agent = AGENT) {
-  if (await hasActiveChat(page)) return true;
-
-  if (!(await isWelcomeNoAgent(page))) {
-    const addAgent = page.getByRole("button", { name: /^Add Agent$/i });
-    if (!(await addAgent.isVisible().catch(() => false))) {
-      return false;
-    }
-  }
-
-  console.log("     ⚠ Welcome/sem agente — completar wizard BYOA…");
-  await startAgentWizard(page);
-
-  if (await page.getByText(/Establish Identity|Agent Name/i).first().isVisible().catch(() => false)) {
-    console.log("     Retomar wizard: Identity → Persona → Generate Soul");
-    await fillAgentIdentity(page, agent);
-    if (!(await clickContinueWhenReady(page, 45_000))) {
-      throw new Error("Continue bloqueado no passo Identity (welcome recovery).");
-    }
-    await sleep(500);
-    await page.getByText(/Shape Personality|Core Archetype/i).first().waitFor({ state: "visible", timeout: 30_000 });
-    await selectPersonaStep(page, agent);
-    await sleep(300);
-    if (!(await clickContinueWhenReady(page, 45_000))) {
-      throw new Error("Continue bloqueado no passo Personality (welcome recovery).");
-    }
-    await sleep(500);
-    if (!(await clickGenerateSoulWhenReady(page, 45_000))) {
-      throw new Error("Generate Soul indisponível (welcome recovery).");
-    }
-    await sleep(1000);
-  }
-
-  await waitPastInitializing(page, 60_000);
-  await ensureChatLoaded(page, "welcome-recovery");
-  await openGeneralChat(page);
-  await waitForComposer(page, 90_000);
-
-  if (!(await hasActiveChat(page))) {
-    throw new Error("Agente não ficou activo após Welcome — chat indisponível.");
-  }
-  return true;
+async function ensureAgentOnChat(page, agent = AGENT, slot = 0) {
+  return runFullByoaWizard(page, agent, slot);
 }
 
 async function isStuckInitializing(page) {
@@ -1425,13 +1513,13 @@ async function escapeStuckInit(page) {
   return true;
 }
 
-async function waitPastInitializing(page, maxMs = 45_000) {
+async function waitPastInitializing(page, maxMs = 45_000, agent = AGENT, slot = 0) {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
     if (await isWelcomeNoAgent(page)) {
-      console.log("     Welcome sem agente após soul — reabrir BYOA…");
-      await startAgentWizard(page);
-      await sleep(1500);
+      console.log("     Welcome — BYOA completo…");
+      await runFullByoaWizard(page, agent, slot);
+      if (await hasActiveChat(page)) return true;
       continue;
     }
     if (await isStuckInitializing(page)) {
@@ -1442,18 +1530,15 @@ async function waitPastInitializing(page, maxMs = 45_000) {
     if (await page.getByRole("button", { name: /General chat/i }).first().isVisible().catch(() => false)) {
       if (await composerReady(page)) return true;
     }
-    await sleep(1500);
+    await sleep(BLACK_SCREEN_POLL_MS);
   }
-  console.log("     Init timeout — navegar para chat…");
-  await page.goto(`${FLOW}/agent/chat`, { waitUntil: "load", timeout: 90_000 }).catch(() => {});
-  await sleep(2000);
   if (await isWelcomeNoAgent(page)) {
-    console.log("     Chat em Welcome — forçar wizard…");
-    await startAgentWizard(page);
+    await runFullByoaWizard(page, agent, slot);
   } else {
+    await page.goto(`${FLOW}/agent/chat`, { waitUntil: "load", timeout: 90_000 }).catch(() => {});
     await escapeStuckInit(page);
   }
-  return true;
+  return hasActiveChat(page);
 }
 
 async function ensureWizardReady(page) {
@@ -1504,51 +1589,13 @@ async function startAgentWizard(page) {
 }
 
 async function runAgentInit(page, agent = AGENT, slot = 0) {
-  const b = flowBrain(page, slot);
-  await startAgentWizard(page);
-  await b.ensureHealthy(agent, "pré-wizard", 4);
-
-  console.log("     Passo 1: Establish Identity");
-  await fillAgentIdentity(page, agent);
-  if (!(await clickContinueWhenReady(page, 45_000))) {
-    throw new Error("Continue bloqueado no passo Identity.");
-  }
-  await b.ensureHealthy(agent, "pós-identity", 4);
-  await sleep(400);
-
-  console.log("     Passo 2: Shape Personality →", agent.persona);
-  await page.getByText(/Shape Personality|Core Archetype/i).first().waitFor({ state: "visible", timeout: 30_000 });
-  await selectPersonaStep(page, agent);
-  await sleep(300);
-  if (!(await clickContinueWhenReady(page, 45_000))) {
-    throw new Error("Continue bloqueado no passo Personality.");
-  }
-  await b.ensureHealthy(agent, "pós-persona", 4);
-  await sleep(400);
-
-  console.log("     Passo 3: Set Boundaries → Generate Soul");
-  if (!(await clickGenerateSoulWhenReady(page, 45_000))) {
-    throw new Error("Generate Soul não ficou disponível.");
-  }
-  await sleep(800);
-
-  console.log("     Aguardar chat (FlowBrain activo)…");
-  await b.waitUntil(
-    async () => {
-      const h = await probePageHealth(page);
-      return h.healthy || (await hasActiveChat(page));
-    },
-    { timeoutMs: 90_000, agent, label: "pós-Generate Soul" }
-  );
-
-  await page.waitForURL(/\/agent\/chat/, { timeout: 30_000 }).catch(async () => {
-    await page.goto(`${FLOW}/agent/chat`, { waitUntil: "load", timeout: 90_000 });
-  });
-  await escapeStuckInit(page);
-  await ensureAgentOnChat(page, agent);
-  await b.ensureHealthy(agent, "chat-final", BLACK_RECOVER_MAX);
+  await requireActiveAgent(page, slot, agent).catch(() => {});
+  await runFullByoaWizard(page, agent, slot);
   await openGeneralChat(page);
   await waitForComposer(page, 90_000, slot, agent);
+  if (!(await hasActiveChat(page))) {
+    throw new Error("runAgentInit: chat inactivo após wizard.");
+  }
 }
 
 async function isChatBlank(page) {
@@ -1571,7 +1618,13 @@ async function isChatBlank(page) {
 }
 
 async function ensureChatLoaded(page, label = "chat", slot = 0, agent = AGENT) {
+  if (await isWelcomeNoAgent(page)) {
+    await runFullByoaWizard(page, agent, slot);
+  }
   await flowBrain(page, slot).ensureHealthy(agent, label, BLACK_RECOVER_MAX);
+  if (!(await hasActiveChat(page)) && (await isWelcomeNoAgent(page))) {
+    await runFullByoaWizard(page, agent, slot);
+  }
   return true;
 }
 
@@ -1933,12 +1986,9 @@ async function waitForProspilotResponse(page, slot, agent = AGENT, sendInfo = {}
 }
 
 async function callProspilot(page, slot, agent = AGENT) {
+  await requireActiveAgent(page, slot, agent);
   const b = flowBrain(page, slot);
   await b.ensureHealthy(agent, "call-prospilot", 10);
-
-  if (await isWelcomeNoAgent(page)) {
-    await ensureAgentOnChat(page, agent);
-  }
   if (!page.url().includes("/agent/chat")) {
     await ensureAgentChat(page);
   }
