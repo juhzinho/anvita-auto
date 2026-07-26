@@ -46,6 +46,9 @@ const BROWSER_RESTART_EVERY = Math.max(5, Number(process.env.ANVITA_BROWSER_REST
 const STUCK_PHASE_MS = Number(process.env.ANVITA_STUCK_MS || 90_000);
 const BLACK_SCREEN_POLL_MS = Number(process.env.ANVITA_BLACK_POLL_MS || 600);
 const BLACK_RECOVER_MAX = Number(process.env.ANVITA_BLACK_RECOVER_MAX || 14);
+const PROSPILOT_ACK_MS = Number(process.env.ANVITA_PROSPILOT_ACK_MS || 45_000);
+const PROSPILOT_SILENT_MS = Number(process.env.ANVITA_PROSPILOT_SILENT_MS || 35_000);
+const PROSPILOT_CMD_TEXT = `@prospilot ${process.env.ANVITA_PROSPILOT_CMD || "What is Faroo?"}`;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -182,10 +185,12 @@ async function smartRecover(page, slot, situation, errMsg) {
   return false;
 }
 
-async function runWithRecovery(page, slot, label, fn, maxAttempts = 4) {
+async function runWithRecovery(page, slot, label, fn, maxAttempts = 4, agent = AGENT) {
   let lastErr;
+  const b = flowBrain(page, slot);
   for (let i = 1; i <= maxAttempts; i++) {
     try {
+      await b.ensureHealthy(agent, `${label}-pre`, 6).catch(() => {});
       assertPageOpen(page);
       return await fn();
     } catch (err) {
@@ -193,6 +198,7 @@ async function runWithRecovery(page, slot, label, fn, maxAttempts = 4) {
       if (err instanceof EmailAlreadyRegisteredError) throw err;
       const msg = String(err.message || err);
       if (i >= maxAttempts) break;
+      await b.ensureHealthy(agent, `${label}-recover`, BLACK_RECOVER_MAX).catch(() => {});
       const situation = await analyzePageSituation(page).catch(() => ({ phase: "unknown" }));
       const recovered = await smartRecover(page, slot, situation, msg);
       if (!recovered) {
@@ -1588,17 +1594,27 @@ async function ensureAgentChat(page) {
   await input.waitFor({ state: "visible", timeout: 60_000 });
 }
 
-async function readChatState(page) {
-  return page.evaluate(() => {
+async function readChatMetrics(page) {
+  return page.evaluate((cmdNeedle) => {
     const full = document.body?.innerText || "";
+    const userMsgCount = (full.match(/@prospilot[^\n]*/gi) || []).length;
+    const lastIdx = full.lastIndexOf("@prospilot");
+    const afterUser = lastIdx >= 0 ? full.slice(lastIdx) : "";
+
     const callingExec = /Calling exec/i.test(full);
     const deepThinking = /Deep thinking/i.test(full);
     const callToolExec = /Call tool exec/i.test(full);
+    const matched = /Matched ProsPilot/i.test(full);
+    const fromProspilot = /from ProsPilot/i.test(full);
+
+    const hasReplyContent =
+      /Faroo|FaroSwap|Faro\b|decentralized exchange|DEX|reply below/i.test(afterUser) ||
+      (fromProspilot && afterUser.length > cmdNeedle.length + 80);
+
+    const processing = callingExec || deepThinking || callToolExec || matched;
 
     const prospilotDone =
-      /from ProsPilot/i.test(full) ||
-      /Matched ProsPilot,\s*reply below/i.test(full) ||
-      (/reply below:/i.test(full) && /ProsPilot/i.test(full) && /AI-generated\.\s*Please verify/i.test(full));
+      (fromProspilot || matched) && hasReplyContent && !callingExec && !callToolExec;
 
     const delegationFailed =
       /command execution tools are unavailable/i.test(full) ||
@@ -1607,134 +1623,218 @@ async function readChatState(page) {
       (/delegation to @prospilot/i.test(full) && /unavailable|cannot complete/i.test(full)) ||
       /Try again later when command execution is available/i.test(full);
 
-    return { callingExec, deepThinking, callToolExec, prospilotDone, delegationFailed, full };
+    const messageVisible = [...document.querySelectorAll("*")].some((el) => {
+      const t = (el.textContent || "").trim();
+      return t.includes("@prospilot") && t.includes("Faroo") && t.length < 200;
+    });
+
+    return {
+      userMsgCount,
+      messageVisible,
+      callingExec,
+      deepThinking,
+      callToolExec,
+      matched,
+      fromProspilot,
+      hasReplyContent,
+      processing,
+      prospilotDone,
+      delegationFailed,
+      silent: userMsgCount > 0 && !processing && !prospilotDone && !delegationFailed,
+      fullLen: full.length,
+    };
+  }, PROSPILOT_CMD);
+}
+
+async function readChatState(page) {
+  const m = await readChatMetrics(page);
+  return {
+    ...m,
+    full: "",
+  };
+}
+
+async function clearComposer(page) {
+  await page.evaluate(() => {
+    const el = document.querySelector(
+      '[contenteditable="true"].tiptap, [contenteditable="true"][data-placeholder*="Tell"]'
+    );
+    if (!el) return;
+    el.focus();
+    el.textContent = "";
+    el.dispatchEvent(new InputEvent("input", { bubbles: true }));
   });
 }
 
-async function sendProspilotMessage(page, slot) {
+async function sendProspilotMessage(page, slot, agent = AGENT) {
+  const tag = slot ? `[P${slot}] ` : "";
+  const text = PROSPILOT_CMD_TEXT;
+  const b = flowBrain(page, slot);
+
+  await b.ensureHealthy(agent, "pré-prospilot", 8);
   await openGeneralChat(page);
   await ensureWafCleared(page);
-  const input = await findChatInput(page);
-  await fillComposer(page, input, `@prospilot ${PROSPILOT_CMD}`);
-  await sleep(250);
-  if (!(await clickText(page, "Send", "Enviar", "Submit"))) {
-    await page.keyboard.press("Enter");
+
+  const before = await readChatMetrics(page);
+
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    slotLog(slot, attempt === 1 ? "Enviar @prospilot…" : `Reenviar @prospilot (${attempt}/5)…`);
+
+    const input = await findChatInput(page);
+    await clearComposer(page);
+    await fillComposer(page, input, text);
+    await sleep(350);
+
+    const clicked = await clickText(page, "Send", "Enviar", "Submit");
+    if (!clicked) {
+      await page.keyboard.press("Enter");
+    }
+    await sleep(1800);
+
+    const after = await readChatMetrics(page);
+    const confirmed =
+      after.messageVisible ||
+      after.userMsgCount > before.userMsgCount ||
+      (after.fullLen > before.fullLen + 20 && after.userMsgCount >= before.userMsgCount);
+
+    if (confirmed) {
+      console.log(`${tag}Mensagem @prospilot confirmada no chat ✅`);
+      return { sentAt: Date.now(), before, after };
+    }
+
+    slotLog(slot, "     ⚠ Mensagem não apareceu — recuperar chat…");
+    await b.execute("chat-empty", agent);
+    await b.ensureHealthy(agent, "send-prospilot", 6);
+    await openGeneralChat(page).catch(() => {});
   }
-  console.log(`${slot ? `[P${slot}] ` : ""}Mensagem @prospilot enviada.`);
+
+  throw new Error("Mensagem @prospilot não confirmada no chat após 5 tentativas.");
 }
 
-async function waitForProspilotResponse(page, slot) {
+async function waitForProspilotResponse(page, slot, agent = AGENT, sendInfo = {}) {
   const tag = slot ? `[P${slot}] ` : "";
   const deadline = Date.now() + RESPONSE_WAIT_MS;
-  console.log(`${tag}Aguardar resposta ProsPilot…`);
+  let sentAt = sendInfo.sentAt || Date.now();
+  console.log(`${tag}Aguardar resposta ProsPilot (só termina com resposta real)…`);
 
   let lastLog = "";
   let polls = 0;
   let resends = 0;
-  let lastPhaseChange = Date.now();
+  let lastActivity = Date.now();
   let lastPhase = "";
-  const MAX_RESEND = Number(process.env.ANVITA_PROSPILOT_RESEND || 6);
+  const MAX_RESEND = Number(process.env.ANVITA_PROSPILOT_RESEND || 8);
+  const b = flowBrain(page, slot);
 
   while (Date.now() < deadline) {
     assertPageOpen(page);
     polls += 1;
 
+    if (polls === 1 || polls % 3 === 0) {
+      await b.ensureHealthy(agent, "prospilot-wait", 4).catch(() => {});
+      await openGeneralChat(page).catch(() => {});
+    }
+
     let s;
     try {
-      if (polls === 1 || polls % 4 === 0) {
-        const h = await probePageHealth(page);
-        if (h.blackScreen || h.initTitle) {
-          await flowBrain(page, slot).execute("black", AGENT);
-        }
-        await openGeneralChat(page).catch(() => {});
-      }
-      s = await readChatState(page);
+      s = await readChatMetrics(page);
     } catch (err) {
       if (/closed|destroyed/i.test(String(err.message || err))) {
         throw new Error("Browser fechado — não feches a janela enquanto o agente chama o ProsPilot.");
       }
-      const situation = await analyzePageSituation(page).catch(() => ({}));
-      if (await smartRecover(page, slot, situation, String(err.message || err))) {
-        await sleep(2000);
-        continue;
-      }
-      throw err;
-    }
-
-    if (
-      s.delegationFailed &&
-      !s.prospilotDone &&
-      !s.callingExec &&
-      !s.callToolExec &&
-      !s.deepThinking &&
-      resends < MAX_RESEND
-    ) {
-      resends += 1;
-      console.log(
-        `${tag}⚠ Tools indisponíveis — reenviar @prospilot (${resends}/${MAX_RESEND})…`
-      );
-      await sleep(2_500);
-      await sendProspilotMessage(page, slot);
-      lastLog = "";
-      lastPhaseChange = Date.now();
-      polls = 0;
+      await b.ensureHealthy(agent, "prospilot-err", 6).catch(() => {});
+      await sleep(2000);
       continue;
     }
 
-    let phase = "a processar…";
+    if (s.processing || s.prospilotDone) lastActivity = Date.now();
+
+    // Sem qualquer actividade após envio → reenviar
+    const sinceSend = Date.now() - sentAt;
+    const sinceActivity = Date.now() - lastActivity;
+    if (
+      sinceSend > PROSPILOT_ACK_MS &&
+      !s.processing &&
+      !s.prospilotDone &&
+      !s.delegationFailed &&
+      resends < MAX_RESEND
+    ) {
+      resends += 1;
+      console.log(`${tag}⚠ Sem ack ${Math.round(sinceSend / 1000)}s — reenviar (${resends}/${MAX_RESEND})…`);
+      const info = await sendProspilotMessage(page, slot, agent);
+      sentAt = info.sentAt;
+      lastActivity = Date.now();
+      lastLog = "";
+      continue;
+    }
+
+    if (s.silent && sinceActivity > PROSPILOT_SILENT_MS && resends < MAX_RESEND) {
+      resends += 1;
+      console.log(`${tag}⚠ Chat silencioso — escala recuperação (${resends}/${MAX_RESEND})…`);
+      await b.ensureHealthy(agent, "prospilot-silent", BLACK_RECOVER_MAX);
+      await openGeneralChat(page).catch(() => {});
+      const info = await sendProspilotMessage(page, slot, agent);
+      sentAt = info.sentAt;
+      lastActivity = Date.now();
+      lastLog = "";
+      continue;
+    }
+
+    if (s.delegationFailed && !s.prospilotDone && !s.processing && resends < MAX_RESEND) {
+      resends += 1;
+      console.log(`${tag}⚠ Tools indisponíveis — reenviar (${resends}/${MAX_RESEND})…`);
+      await sleep(2500);
+      const info = await sendProspilotMessage(page, slot, agent);
+      sentAt = info.sentAt;
+      lastActivity = Date.now();
+      lastLog = "";
+      continue;
+    }
+
+    let phase = "mensagem enviada — aguardar exec…";
     if (s.callToolExec || s.deepThinking) phase = "Deep thinking / Call tool exec…";
     if (s.callingExec) phase = "Calling exec (A2A em curso)…";
+    if (s.matched) phase = "Matched ProsPilot — aguardar reply…";
+    if (s.fromProspilot && !s.hasReplyContent) phase = "ProsPilot respondeu — aguardar conteúdo…";
+
     if (phase !== lastPhase) {
       lastPhase = phase;
-      lastPhaseChange = Date.now();
+      lastActivity = Date.now();
     }
     if (phase !== lastLog) {
       console.log(`${tag}… ${phase}`);
       lastLog = phase;
     }
 
-    if (
-      Date.now() - lastPhaseChange > STUCK_PHASE_MS &&
-      !s.prospilotDone &&
-      resends < MAX_RESEND
-    ) {
-      resends += 1;
-      console.log(`${tag}⚠ Sem progresso ${Math.round(STUCK_PHASE_MS / 1000)}s — recuperar chat + reenviar (${resends}/${MAX_RESEND})…`);
-      await ensureChatLoaded(page, "prospilot-stuck").catch(() => {});
-      await openGeneralChat(page).catch(() => {});
-      await sendProspilotMessage(page, slot);
-      lastPhaseChange = Date.now();
-      lastLog = "";
-      continue;
-    }
-
-    if (s.prospilotDone && !s.callingExec) {
-      console.log(`${tag}✅ Resposta ProsPilot completa.`);
+    // Só concluir com resposta REAL (conteúdo Faroo/reply)
+    if (s.prospilotDone && s.hasReplyContent && !s.callingExec && !s.callToolExec) {
+      console.log(`${tag}✅ Resposta ProsPilot confirmada (conteúdo OK).`);
       await sleep(DONE_SETTLE_MS);
       return true;
     }
 
-    await sleep(POLL_MS);
+    await sleep(BLACK_SCREEN_POLL_MS);
   }
 
-  throw new Error("Timeout aguardando resposta ProsPilot (delegação não concluiu).");
+  throw new Error("Timeout — @prospilot enviado mas resposta nunca apareceu no chat.");
 }
 
-async function callProspilot(page, slot) {
+async function callProspilot(page, slot, agent = AGENT) {
+  const b = flowBrain(page, slot);
+  await b.ensureHealthy(agent, "call-prospilot", 10);
+
+  if (await isWelcomeNoAgent(page)) {
+    await ensureAgentOnChat(page, agent);
+  }
   if (!page.url().includes("/agent/chat")) {
     await ensureAgentChat(page);
-  } else {
-    if (await isWelcomeNoAgent(page)) {
-      throw new Error("ProsPilot bloqueado — Welcome sem agente (falso chat).");
-    }
-    await openGeneralChat(page);
   }
   if (!(await hasActiveChat(page))) {
     throw new Error("ProsPilot bloqueado — chat/composer inactivo.");
   }
-  await sleep(400);
-  await sendProspilotMessage(page, slot);
-  await waitForProspilotResponse(page, slot);
+
+  await openGeneralChat(page);
+  const sendInfo = await sendProspilotMessage(page, slot, agent);
+  await waitForProspilotResponse(page, slot, agent, sendInfo);
 }
 
 const STATE_FILE = path.join(__dirname, "..", ".anvita-auto", "storage-state.json");
@@ -2008,7 +2108,7 @@ async function runOnboard({ page, context, slot = 1, agent = AGENT, mailbox: pre
     }
 
     try {
-      await runWithRecovery(page, slot, "send-otp", () => sendOtpReliable(page, slot, mailbox.email));
+      await runWithRecovery(page, slot, "send-otp", () => sendOtpReliable(page, slot, mailbox.email), 4, agent);
     } catch (err) {
       if (err instanceof EmailAlreadyRegisteredError || /EMAIL_ALREADY_REGISTERED/i.test(String(err.message))) {
         if (mailTry >= 5) throw new Error("Sem emails novos — todos já registados.");
@@ -2018,19 +2118,26 @@ async function runOnboard({ page, context, slot = 1, agent = AGENT, mailbox: pre
     }
 
     slotLog(slot, "3/5 Aguardar OTP…");
-    const otp = await runWithRecovery(page, slot, "wait-otp", () => mailTmWaitOtp(mailbox.token));
+    const otp = await runWithRecovery(page, slot, "wait-otp", () => mailTmWaitOtp(mailbox.token), 4, agent);
     slotLog(slot, `OTP: ${otp}`);
 
-    await runWithRecovery(page, slot, "otp-submit", async () => {
-      await setInput(page, '#otp, input[name="otp"], input[placeholder*="OTP"]', otp);
-      if (!(await clickContinueWhenReady(page, 45_000))) {
-        await clickText(page, "Continue");
-      }
-      await sleep(2000);
-      await solveCaptchaIfAny(page).catch(() => {});
-    });
+    await runWithRecovery(
+      page,
+      slot,
+      "otp-submit",
+      async () => {
+        await setInput(page, '#otp, input[name="otp"], input[placeholder*="OTP"]', otp);
+        if (!(await clickContinueWhenReady(page, 45_000))) {
+          await clickText(page, "Continue");
+        }
+        await sleep(2000);
+        await solveCaptchaIfAny(page).catch(() => {});
+      },
+      4,
+      agent
+    );
 
-    await runWithRecovery(page, slot, "profile", () => completeProfileSetup(page, username, password));
+    await runWithRecovery(page, slot, "profile", () => completeProfileSetup(page, username, password), 4, agent);
     const creds = {
       email: mailbox.email,
       username,
@@ -2042,9 +2149,9 @@ async function runOnboard({ page, context, slot = 1, agent = AGENT, mailbox: pre
     await saveSession(context, creds, slot);
 
     slotLog(slot, "5/5 Criar agente + @prospilot");
-    await runWithRecovery(page, slot, "agent-wizard", () => runAgentInit(page, agent, slot), 5);
+    await runWithRecovery(page, slot, "agent-wizard", () => runAgentInit(page, agent, slot), 5, agent);
     slotLog(slot, `URL: ${page.url()}`);
-    await runWithRecovery(page, slot, "prospilot", () => callProspilot(page, slot), 4);
+    await runWithRecovery(page, slot, "prospilot", () => callProspilot(page, slot, agent), 5, agent);
     await saveSession(context, null, slot);
 
     slotLog(slot, "✅ Concluído!");
