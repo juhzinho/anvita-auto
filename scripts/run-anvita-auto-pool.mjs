@@ -29,6 +29,9 @@ if (!hasPlaywright()) {
 process.env.ANVITA_POOL = "1";
 process.env.ANVITA_POOL_TOTAL = String(total);
 process.env.ANVITA_POOL_WORKERS = String(workers);
+if (process.env.ANVITA_VPS === "1" && process.env.ANVITA_HEADED == null) {
+  process.env.ANVITA_HEADED = "0";
+}
 if (!process.env.ANVITA_BROWSER) {
   if (process.env.ANVITA_VPS === "1") {
     process.env.ANVITA_BROWSER = process.platform === "win32" ? "edge" : "chromium";
