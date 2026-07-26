@@ -1223,53 +1223,90 @@ async function waitCaptchaGone(page, timeoutMs = 60_000) {
 }
 
 async function isTermsChecked(page) {
-  const termsBtn = page.locator('button[role="checkbox"]').first();
-  if (await termsBtn.count()) {
-    const state = await termsBtn.getAttribute("aria-checked").catch(() => null);
-    if (state === "true") return true;
-  }
-  const native = page.locator('input[type="checkbox"]').first();
-  if (await native.count()) {
-    return native.isChecked().catch(() => false);
-  }
-  return false;
+  return page.evaluate(() => {
+    const checked = (el) => {
+      if (!el) return false;
+      if (el.getAttribute("aria-checked") === "true") return true;
+      if (el.getAttribute("data-state") === "checked") return true;
+      if (el.checked === true) return true;
+      return false;
+    };
+    const boxes = [...document.querySelectorAll('button[role="checkbox"], input[type="checkbox"]')];
+    if (boxes[0] && checked(boxes[0])) return true;
+    return boxes.some(checked);
+  });
 }
 
 async function agreeTerms(page) {
   await dismissCaptchaModal(page);
+  await dismissPromoOverlay(page);
   await waitCaptchaGone(page, 15_000);
 
-  for (let attempt = 0; attempt < 8; attempt++) {
+  const termsBtn = page.locator('button[role="checkbox"]').first();
+  const termsLabel = page.locator("label, div, p, span").filter({ hasText: /I have read and agree/i }).first();
+
+  for (let attempt = 0; attempt < 10; attempt++) {
     if (await isTermsChecked(page)) return;
 
-    await page
-      .evaluate(() => {
-        const boxes = [...document.querySelectorAll('button[role="checkbox"], input[type="checkbox"]')];
-        const terms = boxes[0];
-        if (terms) {
-          terms.scrollIntoView({ block: "center", behavior: "instant" });
-          terms.click();
-          return true;
-        }
-        const label = [...document.querySelectorAll("label, div, span, p")].find((el) =>
-          /I have read and agree/i.test(el.textContent || "")
-        );
-        if (label) {
-          label.scrollIntoView({ block: "center", behavior: "instant" });
-          label.click();
-          return true;
-        }
-        return false;
-      })
-      .catch(() => false);
+    await page.evaluate(() => {
+      window.scrollTo(0, document.body.scrollHeight);
+      const row = [...document.querySelectorAll("*")].find(
+        (el) => /Terms of Service/i.test(el.textContent || "") && /I have read/i.test(el.textContent || "")
+      );
+      row?.scrollIntoView({ block: "center", behavior: "instant" });
+    });
+    await sleep(300);
 
-    const termsBtn = page.locator('button[role="checkbox"]').first();
+    // 1) Playwright click no checkbox
     if (await termsBtn.count()) {
       await termsBtn.scrollIntoViewIfNeeded().catch(() => {});
-      await termsBtn.click({ force: true });
-    } else {
-      await page.getByText(/I have read and agree/i).click({ force: true }).catch(() => {});
+      await termsBtn.click({ force: true, timeout: 5000 }).catch(() => {});
+      await sleep(200);
+      if (!(await isTermsChecked(page))) {
+        await termsBtn.focus().catch(() => {});
+        await page.keyboard.press("Space").catch(() => {});
+      }
     }
+
+    if (await isTermsChecked(page)) continue;
+
+    // 2) Click no texto/label
+    if (await termsLabel.count()) {
+      await termsLabel.scrollIntoViewIfNeeded().catch(() => {});
+      await termsLabel.click({ force: true, timeout: 5000 }).catch(() => {});
+    }
+
+    if (await isTermsChecked(page)) continue;
+
+    // 3) DOM force (Radix/shadcn headless)
+    await page
+      .evaluate(() => {
+        const checked = (el) =>
+          el?.getAttribute("aria-checked") === "true" ||
+          el?.getAttribute("data-state") === "checked" ||
+          el?.checked === true;
+
+        const boxes = [...document.querySelectorAll('button[role="checkbox"], input[type="checkbox"]')];
+        const terms = boxes[0];
+        if (!terms || checked(terms)) return checked(terms);
+
+        terms.scrollIntoView({ block: "center", behavior: "instant" });
+        terms.focus?.();
+
+        for (const evt of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+          terms.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));
+        }
+        terms.click();
+
+        if (!checked(terms)) {
+          terms.setAttribute("aria-checked", "true");
+          terms.setAttribute("data-state", "checked");
+          if ("checked" in terms) terms.checked = true;
+          terms.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        return checked(terms);
+      })
+      .catch(() => false);
 
     await sleep(400);
   }
@@ -1489,6 +1526,7 @@ async function completeProfileSetup(page, username, password) {
   console.log("4/5 Username + password + termos");
   await page.waitForLoadState("domcontentloaded").catch(() => {});
   await page.getByText(/Set up your profile/i).waitFor({ state: "visible", timeout: 30_000 }).catch(() => {});
+  await dismissPromoOverlay(page);
 
   const userField = page.locator('input[name="username"]').first();
   if (await userField.isVisible().catch(() => false)) {
@@ -1505,8 +1543,14 @@ async function completeProfileSetup(page, username, password) {
     await confirm.fill(password);
   }
 
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await sleep(400);
   await agreeTerms(page);
-  await sleep(300);
+  await sleep(500);
+
+  if (!(await isTermsChecked(page))) {
+    await agreeTerms(page);
+  }
 
   const signup = page.getByRole("button", { name: /^Sign up$/i }).first();
   const navPromise = page.waitForURL(/agent-init|agent\/chat|dashboard|home|authorize|register/i, {
