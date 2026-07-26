@@ -47,7 +47,7 @@ const STUCK_PHASE_MS = Number(process.env.ANVITA_STUCK_MS || 90_000);
 const BLACK_SCREEN_POLL_MS = Number(process.env.ANVITA_BLACK_POLL_MS || 1000);
 const GUARD_BLACK_COOLDOWN_MS = Number(process.env.ANVITA_GUARD_BLACK_COOLDOWN_MS || 12_000);
 const GUARD_WELCOME_COOLDOWN_MS = Number(process.env.ANVITA_GUARD_WELCOME_COOLDOWN_MS || 25_000);
-const POST_INIT_GRACE_MS = Number(process.env.ANVITA_POST_INIT_GRACE_MS || 3500);
+const POST_INIT_GRACE_MS = Number(process.env.ANVITA_POST_INIT_GRACE_MS || 1500);
 const POST_INIT_POLL_MS = Number(process.env.ANVITA_POST_INIT_POLL_MS || 600);
 const POST_INIT_RELOAD_COOLDOWN_MS = Number(process.env.ANVITA_POST_INIT_RELOAD_COOLDOWN_MS || 8000);
 const POST_INIT_MAX_RELOADS = Number(process.env.ANVITA_POST_INIT_MAX_RELOADS || 4);
@@ -1043,15 +1043,14 @@ async function smartGoto(page, url, timeout = 60_000, slot = 0, agent = AGENT) {
     try {
       await page.goto(url, { waitUntil: NAV_WAIT, timeout });
       await dismissPromoOverlay(page);
-      // Esperar SPA hidratar — sem reload forçado
-      for (let w = 0; w < 20; w++) {
+      for (let w = 0; w < 8; w++) {
         const h = await probePageHealth(page).catch(() => ({}));
-        if (h.loading) {
-          await sleep(1500);
+        if (h.loading || (await isLegitimateInitScreen(page))) {
+          await sleep(600);
           continue;
         }
         if (h.hasValidUi || h.healthy || h.welcome) break;
-        await sleep(1000);
+        await sleep(500);
       }
       return;
     } catch (err) {
@@ -1852,22 +1851,10 @@ async function runFullByoaWizard(page, agent = AGENT, slot = 0) {
       if (!(await clickGenerateSoulWhenReady(page, 45_000))) {
         throw new Error("Generate Soul indisponível");
       }
-      await sleep(1200);
-    }
-
-    slotLog(slot, "     Aguardar chat pós-Generate Soul…");
-    const postInitStart = Date.now();
-    let recoveryDone = false;
-    while (Date.now() - postInitStart < 60_000) {
-      if (await hasActiveChat(page)) break;
-      const stuckMs = Date.now() - postInitStart;
-      if (!recoveryDone && stuckMs >= 3500 && (await isPostInitBlack(page))) {
-        recoveryDone = true;
-        await recoverPostInitBlack(page, slot, agent);
-        if (await hasActiveChat(page)) break;
-      }
       await sleep(800);
     }
+
+    await waitForChatAfterGenerateSoul(page, slot, agent);
 
     if (await hasActiveChat(page)) return true;
 
@@ -1921,9 +1908,17 @@ async function isWelcomeNoAgent(page) {
   });
 }
 
+async function isLegitimateInitScreen(page) {
+  return page.evaluate(() => {
+    if (!location.href.includes("/agent-init")) return false;
+    const t = document.body?.innerText || "";
+    return /Initializing/i.test(t) && /Shaping the soul/i.test(t);
+  });
+}
+
 async function hasActiveChat(page) {
   if (await isWelcomeNoAgent(page)) return false;
-  if (await isStuckInitializing(page)) return false;
+  if (await isLegitimateInitScreen(page)) return false;
   const generalVisible = await page
     .getByRole("button", { name: /General chat/i })
     .first()
@@ -1942,39 +1937,65 @@ async function isPostInitBlack(page) {
 }
 
 async function recoverPostInitBlack(page, slot = 0, agent = AGENT) {
-  slotLog(slot, "🔧 Pós-init tela preta — reload rápido…");
-
-  for (let round = 1; round <= 2; round++) {
-    for (let i = 0; i < 6; i++) {
-      if (await hasActiveChat(page)) return true;
-      await sleep(500);
-    }
-    slotLog(slot, `     Reload ${round}/2…`);
-    await page.reload({ waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
-    for (let i = 0; i < 12; i++) {
-      if (await hasActiveChat(page)) return true;
-      await clickGeneralChat(page).catch(() => {});
-      await sleep(500);
-    }
+  slotLog(slot, "🔧 Pós-init tela preta — reload…");
+  await page.reload({ waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
+  for (let i = 0; i < 15; i++) {
+    if (await hasActiveChat(page)) return true;
+    await clickGeneralChat(page).catch(() => {});
+    await sleep(400);
   }
-
-  slotLog(slot, "     Rota dashboard → chat…");
-  await page.goto(`${FLOW}/dashboard`, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
-  await sleep(600);
   await page.goto(`${FLOW}/agent/chat`, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
   for (let i = 0; i < 10; i++) {
     await clickGeneralChat(page).catch(() => {});
     if (await hasActiveChat(page)) return true;
-    await sleep(500);
+    await sleep(400);
   }
+  return hasActiveChat(page);
+}
 
-  if (await isWelcomeNoAgent(page)) {
-    await runFullByoaWizard(page, agent, slot);
+async function waitForChatAfterGenerateSoul(page, slot = 0, agent = AGENT) {
+  slotLog(slot, "     Aguardar chat pós-Generate Soul…");
+  const deadline = Date.now() + 45_000;
+  let blackSince = 0;
+  let reloads = 0;
+
+  while (Date.now() < deadline) {
+    if (await hasActiveChat(page)) return true;
+
+    const url = page.url();
+    if (await isLegitimateInitScreen(page)) {
+      blackSince = 0;
+      await sleep(400);
+      continue;
+    }
+
+    if (url.includes("/agent/chat") && (await isPostInitBlack(page))) {
+      if (!blackSince) blackSince = Date.now();
+      if (Date.now() - blackSince >= POST_INIT_GRACE_MS && reloads < 3) {
+        reloads += 1;
+        slotLog(slot, `     Tela preta pós-init — reload ${reloads}/3`);
+        await page.reload({ waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
+        await sleep(800);
+        await clickGeneralChat(page).catch(() => {});
+        blackSince = 0;
+      }
+      await sleep(400);
+      continue;
+    }
+
+    if (url.includes("/agent-init") && !(await isLegitimateInitScreen(page))) {
+      await page.goto(`${FLOW}/agent/chat`, { waitUntil: "domcontentloaded", timeout: 90_000 }).catch(() => {});
+      await sleep(600);
+    }
+
+    blackSince = 0;
+    await sleep(400);
   }
   return hasActiveChat(page);
 }
 
 async function isStuckInitializing(page) {
+  if (await isLegitimateInitScreen(page)) return false;
   if (await isPostInitBlack(page)) return true;
   return page.evaluate(() => {
     const t = document.body?.innerText || "";
