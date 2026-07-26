@@ -73,6 +73,24 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** Evita crash quando a página navega durante page.evaluate. */
+async function safeEvaluate(page, fn, arg, retries = 4) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      if (page.isClosed()) return null;
+      await page.waitForLoadState("domcontentloaded", { timeout: 10_000 }).catch(() => {});
+      return arg !== undefined ? await page.evaluate(fn, arg) : await page.evaluate(fn);
+    } catch (err) {
+      const msg = String(err.message || err);
+      if (!/context.*destroyed|navigation|detached|Target closed/i.test(msg) || i >= retries - 1) {
+        throw err;
+      }
+      await sleep(600 + i * 400);
+    }
+  }
+  return null;
+}
+
 async function fetchWithRetry(url, options = {}, retries = 5) {
   let lastErr;
   for (let i = 1; i <= retries; i++) {
@@ -95,8 +113,7 @@ async function fetchWithRetry(url, options = {}, retries = 5) {
 async function analyzePageSituation(page) {
   if (page.isClosed()) return { phase: "closed", closed: true };
   const url = page.url();
-  const state = await page
-    .evaluate(() => {
+  const state = await safeEvaluate(page, () => {
       const text = document.body?.innerText || "";
       return {
         hasRegister: !!document.querySelector('#email, input[name="email"], input[type="email"]'),
@@ -116,8 +133,7 @@ async function analyzePageSituation(page) {
         prospilotDone: /from ProsPilot|Matched ProsPilot/i.test(text),
         delegationFailed: /command execution tools are unavailable|cannot complete the delegation/i.test(text),
       };
-    })
-    .catch(() => ({}));
+    }).catch(() => ({}));
 
   let phase = "unknown";
   if (state.hasInitializing) phase = "stuck-init";
@@ -153,8 +169,14 @@ async function smartRecover(page, slot, situation, errMsg) {
   const msg = String(errMsg || "");
   slotLog(slot, `🔧 Recuperar (${situation?.phase || "?"}) — ${msg.slice(0, 100)}`);
 
-  if (situation?.closed || /closed|crashed|Target page|context.*destroyed/i.test(msg)) {
+  if (situation?.closed || /closed|crashed|Target page/i.test(msg)) {
     return false;
+  }
+
+  if (/context.*destroyed|Execution context was destroyed|navigation/i.test(msg)) {
+    await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
+    await sleep(1200);
+    return true;
   }
 
   if (
@@ -163,6 +185,10 @@ async function smartRecover(page, slot, situation, errMsg) {
     /Terms of Service|Set up your profile|Send OTP/i.test(msg)
   ) {
     if (situation?.phase === "register-profile" || /Terms of Service|Set up your profile/i.test(msg)) {
+      if (!page.url().includes("/register")) {
+        await openRegisterPage(page).catch(() => {});
+        await sleep(1000);
+      }
       await agreeTerms(page).catch(() => {});
       await sleep(400);
     } else {
@@ -235,6 +261,12 @@ async function runWithRecovery(page, slot, label, fn, maxAttempts = 4, agent = A
       if (err instanceof EmailAlreadyRegisteredError) throw err;
       const msg = String(err.message || err);
       if (i >= maxAttempts) break;
+      if (/context.*destroyed|Execution context was destroyed/i.test(msg)) {
+        await page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
+        await sleep(1500);
+        slotLog(slot, `     Retry ${label} (${i}/${maxAttempts}) — página navegou…`);
+        continue;
+      }
       if (!(await isRegisterFlowPage(page))) {
         await b.ensureHealthy(agent, `${label}-recover`, 4).catch(() => {});
       }
@@ -253,13 +285,12 @@ async function runWithRecovery(page, slot, label, fn, maxAttempts = 4, agent = A
 
 async function probePageHealth(page) {
   if (page.isClosed()) return { closed: true, blackScreen: true, healthy: false };
-  const url = page.url();
-  return page
-    .evaluate(({ chatPath }) => {
+  return safeEvaluate(
+    page,
+    () => {
       const text = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
       const title = document.title || "";
       const buttons = document.querySelectorAll("button").length;
-      const inputs = document.querySelectorAll('input, textarea, [contenteditable="true"]').length;
       const root = document.querySelector("#root, #__next, main, [class*='layout']");
       const rootText = (root?.innerText || "").replace(/\s+/g, " ").trim();
       const bg = getComputedStyle(document.body).backgroundColor || "";
@@ -317,7 +348,6 @@ async function probePageHealth(page) {
         !isInitAgentTitle &&
         (hasSpinner || isLoadingText || (hasNavShell && text.length < 50));
 
-      // Registo/wizard são páginas escuras normais — NUNCA tratar como tela preta
       if ((onRegister && hasRegisterUi) || (onAgentInit && hasWizardUi) || isHydrating) {
         return {
           textLen: text.length,
@@ -339,7 +369,6 @@ async function probePageHealth(page) {
         };
       }
 
-      // Tela preta só em /agent/chat (nunca em /register)
       const blackScreen =
         onChat &&
         ((initTitle && !composerOk && !hasGeneral && !welcome) ||
@@ -366,8 +395,9 @@ async function probePageHealth(page) {
         hasValidUi,
         healthy: hasGeneral && composerOk,
       };
-    }, { chatPath: "/agent/chat" })
-    .catch(() => ({ blackScreen: true, healthy: false, textLen: 0, initTitle: true }));
+    },
+    undefined
+  ).catch(() => ({ blackScreen: true, healthy: false, textLen: 0, initTitle: true }));
 }
 
 async function assertNotBlack(page, slot, agent, label = "page") {
@@ -1314,36 +1344,45 @@ async function agreeTerms(page) {
   await dismissCaptchaModal(page);
   await dismissPromoOverlay(page);
   await waitCaptchaGone(page, 15_000);
+  await page.waitForLoadState("domcontentloaded").catch(() => {});
 
+  const maxAttempts = process.env.ANVITA_VPS === "1" ? 15 : 10;
   const termsBtn = page.locator('button[role="checkbox"]').first();
   const termsLabel = page.locator("label, div, p, span").filter({ hasText: /I have read and agree/i }).first();
+  const termsText = page.getByText(/I have read and agree to the Terms of Service/i).first();
 
-  for (let attempt = 0; attempt < 10; attempt++) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (await isTermsChecked(page)) return;
 
-    await page.evaluate(() => {
+    await safeEvaluate(page, () => {
       window.scrollTo(0, document.body.scrollHeight);
       const row = [...document.querySelectorAll("*")].find(
         (el) => /Terms of Service/i.test(el.textContent || "") && /I have read/i.test(el.textContent || "")
       );
       row?.scrollIntoView({ block: "center", behavior: "instant" });
-    });
+    }).catch(() => {});
     await sleep(300);
 
-    // 1) Playwright click no checkbox
-    if (await termsBtn.count()) {
-      await termsBtn.scrollIntoViewIfNeeded().catch(() => {});
-      await termsBtn.click({ force: true, timeout: 5000 }).catch(() => {});
+    // 1) Click no texto completo dos termos
+    if (await termsText.count()) {
+      await termsText.scrollIntoViewIfNeeded().catch(() => {});
+      await termsText.click({ force: true, timeout: 5000 }).catch(() => {});
       await sleep(200);
-      if (!(await isTermsChecked(page))) {
-        await termsBtn.focus().catch(() => {});
-        await page.keyboard.press("Space").catch(() => {});
-      }
+    }
+
+    // 2) Playwright click no checkbox
+    const boxCount = await page.locator('button[role="checkbox"], input[type="checkbox"]').count();
+    for (let bi = 0; bi < boxCount; bi++) {
+      const cb = page.locator('button[role="checkbox"], input[type="checkbox"]').nth(bi);
+      await cb.scrollIntoViewIfNeeded().catch(() => {});
+      await cb.click({ force: true, timeout: 3000 }).catch(() => {});
+      await page.keyboard.press("Space").catch(() => {});
+      if (await isTermsChecked(page)) break;
     }
 
     if (await isTermsChecked(page)) continue;
 
-    // 2) Click no texto/label
+    // 3) Click no label
     if (await termsLabel.count()) {
       await termsLabel.scrollIntoViewIfNeeded().catch(() => {});
       await termsLabel.click({ force: true, timeout: 5000 }).catch(() => {});
@@ -1351,33 +1390,32 @@ async function agreeTerms(page) {
 
     if (await isTermsChecked(page)) continue;
 
-    // 3) DOM force (Radix/shadcn headless)
-    await page
-      .evaluate(() => {
+    // 4) DOM force (Radix/shadcn headless)
+    await safeEvaluate(page, () => {
         const checked = (el) =>
           el?.getAttribute("aria-checked") === "true" ||
           el?.getAttribute("data-state") === "checked" ||
           el?.checked === true;
 
         const boxes = [...document.querySelectorAll('button[role="checkbox"], input[type="checkbox"]')];
-        const terms = boxes[0];
-        if (!terms || checked(terms)) return checked(terms);
-
-        terms.scrollIntoView({ block: "center", behavior: "instant" });
-        terms.focus?.();
-
-        for (const evt of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
-          terms.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));
+        for (const terms of boxes) {
+          if (checked(terms)) return true;
+          terms.scrollIntoView({ block: "center", behavior: "instant" });
+          terms.focus?.();
+          for (const evt of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+            terms.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));
+          }
+          terms.click();
+          if (!checked(terms)) {
+            terms.setAttribute("aria-checked", "true");
+            terms.setAttribute("data-state", "checked");
+            if ("checked" in terms) terms.checked = true;
+            terms.dispatchEvent(new Event("change", { bubbles: true }));
+            terms.dispatchEvent(new Event("input", { bubbles: true }));
+          }
+          if (checked(terms)) return true;
         }
-        terms.click();
-
-        if (!checked(terms)) {
-          terms.setAttribute("aria-checked", "true");
-          terms.setAttribute("data-state", "checked");
-          if ("checked" in terms) terms.checked = true;
-          terms.dispatchEvent(new Event("change", { bubbles: true }));
-        }
-        return checked(terms);
+        return false;
       })
       .catch(() => false);
 
