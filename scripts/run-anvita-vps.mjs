@@ -3,7 +3,7 @@
  * Runner VPS (Windows ou Linux) — headless, multi-browser.
  *
  *   npm run anvita:vps
- *   node scripts/run-anvita-vps.mjs 500 5 edge
+ *   node scripts/run-anvita-vps.mjs 500 3 edge
  *   node scripts/run-anvita-vps.mjs 50 5 chrome
  *
  * Windows VPS default: Edge (já vem instalado)
@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2).filter((a) => !a.startsWith("--"));
 const total = args[0] || process.env.ANVITA_POOL_TOTAL || "500";
-const workers = args[1] || process.env.ANVITA_POOL_WORKERS || "5";
+const workers = args[1] || process.env.ANVITA_POOL_WORKERS || "3";
 const defaultBrowser = process.platform === "win32" ? "edge" : "chromium";
 const browser = (args[2] || process.env.ANVITA_BROWSER || defaultBrowser).toLowerCase();
 
@@ -30,6 +30,10 @@ if (process.env.ANVITA_GUARD == null) process.env.ANVITA_GUARD = "1";
 process.env.ANVITA_BROWSER = browser;
 process.env.ANVITA_POOL_TOTAL = String(total);
 process.env.ANVITA_POOL_WORKERS = String(workers);
+
+const autoDir = path.join(root, ".anvita-auto");
+fs.mkdirSync(autoDir, { recursive: true });
+fs.writeFileSync(path.join(autoDir, "pool-active-workers"), String(workers));
 
 const platformLabel = process.platform === "win32" ? "Windows VPS" : "Linux VPS";
 const headless = process.env.ANVITA_HEADED === "0";

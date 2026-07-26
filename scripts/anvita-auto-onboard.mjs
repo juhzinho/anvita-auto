@@ -1326,7 +1326,7 @@ async function waitCaptchaGone(page, timeoutMs = 60_000) {
 }
 
 async function isTermsChecked(page) {
-  return page.evaluate(() => {
+  return safeEvaluate(page, () => {
     const checked = (el) => {
       if (!el) return false;
       if (el.getAttribute("aria-checked") === "true") return true;
@@ -1335,9 +1335,33 @@ async function isTermsChecked(page) {
       return false;
     };
     const boxes = [...document.querySelectorAll('button[role="checkbox"], input[type="checkbox"]')];
-    if (boxes[0] && checked(boxes[0])) return true;
-    return boxes.some(checked);
-  });
+    if (boxes.some(checked)) return true;
+    // Formulário aceita via state React hidden
+    const hidden = document.querySelector('input[name*="terms" i], input[name*="agree" i]');
+    if (hidden?.value === "true" || hidden?.checked) return true;
+    return false;
+  }).catch(() => false);
+}
+
+async function forceTermsCheckedDom(page) {
+  return safeEvaluate(page, () => {
+    const mark = (el) => {
+      if (!el) return;
+      el.setAttribute("aria-checked", "true");
+      el.setAttribute("data-state", "checked");
+      if ("checked" in el) el.checked = true;
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    for (const el of document.querySelectorAll('button[role="checkbox"], input[type="checkbox"]')) {
+      mark(el);
+    }
+    for (const el of document.querySelectorAll('input[name*="terms" i], input[name*="agree" i]')) {
+      mark(el);
+      if ("value" in el) el.value = "true";
+    }
+    return true;
+  }).catch(() => false);
 }
 
 async function agreeTerms(page) {
@@ -1346,10 +1370,9 @@ async function agreeTerms(page) {
   await waitCaptchaGone(page, 15_000);
   await page.waitForLoadState("domcontentloaded").catch(() => {});
 
-  const maxAttempts = process.env.ANVITA_VPS === "1" ? 15 : 10;
-  const termsBtn = page.locator('button[role="checkbox"]').first();
-  const termsLabel = page.locator("label, div, p, span").filter({ hasText: /I have read and agree/i }).first();
+  const maxAttempts = process.env.ANVITA_VPS === "1" ? 20 : 10;
   const termsText = page.getByText(/I have read and agree to the Terms of Service/i).first();
+  const termsCheckbox = page.getByRole("checkbox").first();
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (await isTermsChecked(page)) return;
@@ -1363,14 +1386,26 @@ async function agreeTerms(page) {
     }).catch(() => {});
     await sleep(300);
 
-    // 1) Click no texto completo dos termos
+    // 1) Playwright check() no checkbox ARIA
+    if (await termsCheckbox.count()) {
+      await termsCheckbox.scrollIntoViewIfNeeded().catch(() => {});
+      await termsCheckbox.check({ force: true, timeout: 8000 }).catch(async () => {
+        await termsCheckbox.click({ force: true, timeout: 5000 }).catch(() => {});
+        await page.keyboard.press("Space").catch(() => {});
+      });
+    }
+
+    if (await isTermsChecked(page)) continue;
+
+    // 2) Click no texto dos termos
     if (await termsText.count()) {
       await termsText.scrollIntoViewIfNeeded().catch(() => {});
       await termsText.click({ force: true, timeout: 5000 }).catch(() => {});
-      await sleep(200);
     }
 
-    // 2) Playwright click no checkbox
+    if (await isTermsChecked(page)) continue;
+
+    // 3) Todos os checkboxes visíveis
     const boxCount = await page.locator('button[role="checkbox"], input[type="checkbox"]').count();
     for (let bi = 0; bi < boxCount; bi++) {
       const cb = page.locator('button[role="checkbox"], input[type="checkbox"]').nth(bi);
@@ -1382,47 +1417,22 @@ async function agreeTerms(page) {
 
     if (await isTermsChecked(page)) continue;
 
-    // 3) Click no label
-    if (await termsLabel.count()) {
-      await termsLabel.scrollIntoViewIfNeeded().catch(() => {});
-      await termsLabel.click({ force: true, timeout: 5000 }).catch(() => {});
-    }
+    // 4) Force DOM (Radix headless)
+    await forceTermsCheckedDom(page);
+    await sleep(300);
+  }
 
-    if (await isTermsChecked(page)) continue;
-
-    // 4) DOM force (Radix/shadcn headless)
-    await safeEvaluate(page, () => {
-        const checked = (el) =>
-          el?.getAttribute("aria-checked") === "true" ||
-          el?.getAttribute("data-state") === "checked" ||
-          el?.checked === true;
-
-        const boxes = [...document.querySelectorAll('button[role="checkbox"], input[type="checkbox"]')];
-        for (const terms of boxes) {
-          if (checked(terms)) return true;
-          terms.scrollIntoView({ block: "center", behavior: "instant" });
-          terms.focus?.();
-          for (const evt of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
-            terms.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window }));
-          }
-          terms.click();
-          if (!checked(terms)) {
-            terms.setAttribute("aria-checked", "true");
-            terms.setAttribute("data-state", "checked");
-            if ("checked" in terms) terms.checked = true;
-            terms.dispatchEvent(new Event("change", { bubbles: true }));
-            terms.dispatchEvent(new Event("input", { bubbles: true }));
-          }
-          if (checked(terms)) return true;
-        }
-        return false;
-      })
-      .catch(() => false);
-
+  if (!(await isTermsChecked(page))) {
+    await forceTermsCheckedDom(page);
     await sleep(400);
   }
 
   if (!(await isTermsChecked(page))) {
+    if (process.env.ANVITA_VPS === "1") {
+      console.warn("     ⚠ Terms — force DOM VPS (continuar Sign up)");
+      await forceTermsCheckedDom(page);
+      return;
+    }
     const shot = path.join(__dirname, "..", ".anvita-auto", "terms-fail.png");
     mkdirSync(path.dirname(shot), { recursive: true });
     await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
@@ -1654,36 +1664,42 @@ async function completeProfileSetup(page, username, password) {
     await confirm.fill(password);
   }
 
-  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
   await sleep(400);
+  await forceTermsCheckedDom(page).catch(() => {});
   await agreeTerms(page);
   await sleep(500);
 
-  if (!(await isTermsChecked(page))) {
-    await agreeTerms(page);
-  }
-
   const signup = page.getByRole("button", { name: /^Sign up$/i }).first();
-  const navPromise = page.waitForURL(/agent-init|agent\/chat|dashboard|home|authorize|register/i, {
-    timeout: 90_000,
-  });
 
-  if (await signup.isVisible().catch(() => false)) {
-    await signup.click();
-  } else {
-    await clickText(page, "Sign up", "Continue", "Create");
-  }
+  for (let signupTry = 0; signupTry < 4; signupTry++) {
+    if (!(await isTermsChecked(page))) {
+      await forceTermsCheckedDom(page);
+      await agreeTerms(page).catch(() => {});
+    }
 
-  await solveCaptchaIfAny(page).catch(() => {});
+    if (await signup.isVisible().catch(() => false)) {
+      await signup.click({ force: true, timeout: process.env.ANVITA_VPS === "1" ? 60_000 : 30_000 }).catch(() => {});
+    } else {
+      await clickText(page, "Sign up", "Continue", "Create");
+    }
 
-  const termsError = page.getByText(/agree to the Terms of Service/i);
-  if (await termsError.isVisible().catch(() => false)) {
-    await agreeTerms(page);
-    if (await signup.isVisible().catch(() => false)) await signup.click();
     await solveCaptchaIfAny(page).catch(() => {});
+
+    const termsError = page.getByText(/agree to the Terms of Service/i);
+    if (await termsError.isVisible().catch(() => false)) {
+      await forceTermsCheckedDom(page);
+      await agreeTerms(page).catch(() => {});
+      continue;
+    }
+
+    const navigated = await page
+      .waitForURL(/agent-init|agent\/chat|dashboard|home|authorize/i, { timeout: 20_000 })
+      .then(() => true)
+      .catch(() => false);
+    if (navigated) break;
   }
 
-  await navPromise.catch(() => {});
   await sleep(800);
 }
 

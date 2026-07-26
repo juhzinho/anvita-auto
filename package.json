@@ -7,7 +7,7 @@
     "anvita:auto": "node scripts/run-anvita-auto.mjs",
     "anvita:auto:2": "node scripts/run-anvita-auto-batch.mjs 2 --parallel",
     "anvita:auto:100": "node scripts/run-anvita-auto-pool.mjs 100 3",
-    "anvita:vps": "node scripts/run-anvita-vps.mjs 500 5",
+    "anvita:vps": "node scripts/run-anvita-vps.mjs 500 3",
     "anvita:auto:3": "node scripts/run-anvita-auto-batch.mjs 3 --parallel",
     "anvita:auto:5": "node scripts/run-anvita-auto-batch.mjs 5 --parallel",
     "anvita:auto:10": "node scripts/run-anvita-auto-batch.mjs 10 --parallel",
